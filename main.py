@@ -1,5 +1,4 @@
 # YTDL GUI - Windows-only (Python 3.12+)
-# PROVIDED AS-IS WITH NO SUPPORT (sorry x)
 #
 # pip deps:
 # pip install PySide6 requests mutagen
@@ -1987,3 +1986,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
