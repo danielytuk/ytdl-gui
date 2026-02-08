@@ -23,7 +23,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12.10"
-          cache: "pip"
 
       - name: Install dependencies (no requirements.txt)
         shell: pwsh
