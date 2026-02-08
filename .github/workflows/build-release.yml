@@ -1,0 +1,70 @@
+name: Build EXE and Create Release
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "main.py"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.10"
+          cache: "pip"
+
+      - name: Install dependencies (no requirements.txt)
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+
+          # Build tool
+          pip install pyinstaller
+
+          # Your runtime deps (add/remove as your imports require)
+          pip install yt-dlp
+          pip install PySide6
+          pip install mutagen
+          pip install shazamio
+          pip install spotapi
+
+      - name: Build with PyInstaller
+        shell: pwsh
+        run: |
+          pyinstaller --clean --noconsole --onefile --name "YTDL" --icon "icon.ico" --hidden-import shazamio --hidden-import mutagen --hidden-import PySide6 --hidden-import spotapi "main.py"
+
+      - name: Prepare exact asset name (YTDL.exe)
+        shell: pwsh
+        run: |
+          if (!(Test-Path "dist\YTDL.exe")) { throw "Build failed: dist\YTDL.exe not found" }
+          Copy-Item -Force "dist\YTDL.exe" "YTDL.exe"
+          if (!(Test-Path "YTDL.exe")) { throw "YTDL.exe was not created" }
+
+      - name: Create unique release tag
+        id: tag
+        shell: pwsh
+        run: |
+          $sha = "${env:GITHUB_SHA}".Substring(0,7)
+          $tag = "build-${env:GITHUB_RUN_NUMBER}-$sha"
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Create GitHub Release and upload YTDL.exe
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          generate_release_notes: true
+          files: |
+            YTDL.exe
