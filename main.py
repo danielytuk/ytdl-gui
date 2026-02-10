@@ -447,6 +447,7 @@ class TrackMeta:
     disc_total: str = ""
     isrc: str = ""
     itunes_track_id: str = ""
+    itunes_collection_id: str = ""  # ✅ album/collection id for playlist album caching
     artwork_url: str = ""
     artwork_jpeg: bytes = b""
     comment: str = ""  # Source URL
@@ -519,6 +520,28 @@ def itunes_lookup(cs: CooldownSession, track_id: str) -> Dict[str, Any]:
     r = cs.get(url, params=params, timeout=25)
     r.raise_for_status()
     return r.json()
+
+
+def itunes_lookup_album_tracks(cs: CooldownSession, collection_id: str, limit: int = 200) -> List[Dict[str, Any]]:
+    """
+    iTunes lookup for an album/collection:
+      https://itunes.apple.com/lookup?id=<collectionId>&entity=song
+    Returns raw result dicts for songs.
+    """
+    cid = (collection_id or "").strip()
+    if not cid.isdigit():
+        return []
+    url = "https://itunes.apple.com/lookup"
+    params = {"id": cid, "entity": "song", "limit": str(limit)}
+    r = cs.get(url, params=params, timeout=25)
+    r.raise_for_status()
+    data = r.json() or {}
+    res = data.get("results") or []
+    out: List[Dict[str, Any]] = []
+    for item in res:
+        if isinstance(item, dict) and item.get("kind") == "song" and item.get("trackName"):
+            out.append(item)
+    return out
 
 
 def songlink_lookup(cs: CooldownSession, query_url: str) -> Dict[str, Any]:
@@ -639,6 +662,10 @@ def meta_from_itunes_item(item: Dict[str, Any]) -> TrackMeta:
     track_id = item.get("trackId")
     if track_id:
         m.itunes_track_id = str(track_id)
+
+    col_id = item.get("collectionId")
+    if col_id:
+        m.itunes_collection_id = str(col_id)
 
     art = item.get("artworkUrl100") or item.get("artworkUrl60") or ""
     m.artwork_url = upgrade_artwork_url(art) if art else ""
@@ -1175,6 +1202,7 @@ def merge_meta(base: TrackMeta, incoming: TrackMeta, prefer_incoming: bool = Tru
         "disc_total",
         "isrc",
         "itunes_track_id",
+        "itunes_collection_id",
         "artwork_url",
         "comment",
     ):
@@ -1186,7 +1214,15 @@ def merge_meta(base: TrackMeta, incoming: TrackMeta, prefer_incoming: bool = Tru
             if b and not a:
                 setattr(out, field, b)
             # allow "strong" fields to upgrade even when already present
-            elif b and a and field in ("album", "year", "genre", "itunes_track_id", "artwork_url", "isrc"):
+            elif b and a and field in (
+                "album",
+                "year",
+                "genre",
+                "itunes_track_id",
+                "itunes_collection_id",
+                "artwork_url",
+                "isrc",
+            ):
                 setattr(out, field, b)
         else:
             if not a and b:
@@ -1320,7 +1356,7 @@ def itunes_candidates(cs: CooldownSession, artist: str, title: str, limit: int =
     seen = set()
     ded: List[TrackMeta] = []
     for m in out:
-        k = f"{_norm(m.artist)}|{_norm(m.title)}|{_norm(m.album)}"
+        k = f"{_norm(m.artist)}|{_norm(m.title)}|{_norm(m.album)}|{m.itunes_track_id}"
         if k in seen:
             continue
         seen.add(k)
@@ -1487,6 +1523,88 @@ def advanced_enrich_all_sources(
     return sources
 
 
+# ---- Review candidate rules (your #2) ----
+def candidate_has_all_review_fields(m: TrackMeta) -> bool:
+    """
+    "Don't show items if they can't fill all the information in the Review Metadata pop-up."
+    The popup shows: Title, Artist, Album, Release(year), Source, plus artwork preview.
+    We'll require: title, artist, album, year, and a meaningful source.
+    Artwork is optional (preview can be blank).
+    """
+    return bool((m.title or "").strip()) and bool((m.artist or "").strip()) and bool((m.album or "").strip()) and bool(
+        (m.year or "").strip()
+    ) and bool((m.source or "").strip())
+
+
+def _candidate_quality_score(m: TrackMeta) -> int:
+    # used for dedup collapsing: keep the "best-filled" one
+    score = 0
+    for f in ("title", "artist", "album", "year", "genre", "track_number", "track_total", "isrc", "itunes_track_id", "itunes_collection_id", "artwork_url"):
+        if getattr(m, f):
+            score += 1
+    if m.artwork_jpeg:
+        score += 1
+    return score
+
+
+def _dedup_merge_candidates(cands: List[TrackMeta]) -> List[TrackMeta]:
+    """
+    Merge duplicates like:
+      tally hall - Greener
+      Tally Hall - Greener
+      Tally Hall - GREENER
+
+    We merge primarily by normalized artist+title, then prefer a candidate with:
+      - non-empty album/year (and overall more fields)
+      - iTunes as a tie-break (stable default + best completeness)
+    Album differences:
+      - if one has empty album and the other has album -> treat as same and keep the fuller one.
+    """
+    buckets: Dict[str, List[TrackMeta]] = {}
+    for m in cands:
+        key = f"{_norm(m.artist)}|{_norm(m.title)}"
+        buckets.setdefault(key, []).append(m)
+
+    out: List[TrackMeta] = []
+    for key, items in buckets.items():
+        # collapse further by album if both non-empty and different
+        # (some tracks genuinely share title/artist but are different albums)
+        sub: Dict[str, List[TrackMeta]] = {}
+        for it in items:
+            alb_norm = _norm(it.album)
+            # treat empty album as wildcard -> use special token
+            alb_key = alb_norm if alb_norm else "__EMPTY__"
+            sub.setdefault(alb_key, []).append(it)
+
+        # if there is both "__EMPTY__" and one real album, merge empties into the real album with best score
+        if "__EMPTY__" in sub and len(sub) > 1:
+            empties = sub.pop("__EMPTY__", [])
+            # merge empties into the best real album bucket (by max score)
+            best_real_key = max(sub.keys(), key=lambda k: max(_candidate_quality_score(x) for x in sub[k]))
+            sub[best_real_key].extend(empties)
+
+        for alb_key, group in sub.items():
+            # pick best item; prefer iTunes as stable best default
+            def pick_key(x: TrackMeta):
+                return (
+                    1 if (x.source or "").strip().lower() == "itunes" else 0,
+                    _candidate_quality_score(x),
+                )
+
+            best = max(group, key=pick_key)
+            # merge in additional fields from others (fill blanks)
+            merged = TrackMeta(**best.__dict__)
+            for other in group:
+                if other is best:
+                    continue
+                merged = merge_meta(merged, other, prefer_incoming=True)
+            out.append(merged)
+
+    # stable ordering: iTunes first (so default selection can be iTunes easily), then by score
+    out.sort(key=lambda m: ((m.source or "").strip().lower() != "itunes", -_candidate_quality_score(m)))
+    return out
+
+
 def build_review_candidates(
     cs: CooldownSession,
     yt_raw: str,
@@ -1498,6 +1616,12 @@ def build_review_candidates(
 ) -> List[TrackMeta]:
     """
     Build a deduped list of candidates for the combo box, with artwork prefetched where possible.
+
+    Changes:
+      ✅ Merge duplicates (case / minor variations)
+      ✅ Remove candidates that can't fill all fields shown in the dialog
+      ✅ Keep at least one candidate (fallback to current_merged)
+      ✅ Prefer iTunes to appear first (default selection)
     """
     merged: List[TrackMeta] = []
 
@@ -1506,7 +1630,7 @@ def build_review_candidates(
     cur.source = cur.source or "Current"
     merged.append(cur)
 
-    # Parsed YT title candidate
+    # Parsed YT title candidate (likely incomplete, but keep temporarily—filter may remove)
     yt_candidate = TrackMeta(
         title=yt_title or (yt_raw or ""),
         artist=yt_artist or "",
@@ -1526,21 +1650,33 @@ def build_review_candidates(
     for m in extra_itunes:
         merged.append(TrackMeta(**m.__dict__))
 
-    # Dedup by artist+title+album+source-ish
-    seen = set()
-    out: List[TrackMeta] = []
-    for m in merged:
-        k = f"{_norm(m.artist)}|{_norm(m.title)}|{_norm(m.album)}|{_norm(m.source)}"
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(m)
-
-    # Prefetch artwork for top options so dialog can show it instantly
-    for m in out[:10]:
+    # Prefetch artwork for top options *before* filtering/dedup (best-effort)
+    for m in merged[:12]:
         ensure_artwork(cs, m)
 
-    return out[:10]
+    # Dedup + merge duplicates
+    merged2 = _dedup_merge_candidates(merged)
+
+    # Filter out incomplete candidates (your #2)
+    filtered = [m for m in merged2 if candidate_has_all_review_fields(m)]
+
+    # Ensure at least one candidate remains
+    if not filtered:
+        # fallback: try best iTunes-ish candidate even if year missing; else keep current merged
+        it = next((m for m in merged2 if (m.source or "").lower() == "itunes" and m.title and m.artist and m.album), None)
+        if it:
+            filtered = [it]
+        else:
+            filtered = [cur]
+
+    # Limit
+    filtered = filtered[:10]
+
+    # Ensure artwork on remaining
+    for m in filtered:
+        ensure_artwork(cs, m)
+
+    return filtered
 
 
 def enrich_after_user_choice(
@@ -1616,6 +1752,12 @@ class PipelineWorker(QtCore.QObject):
         # Store candidates for current review request
         self._review_candidates: List[TrackMeta] = []
 
+        # ✅ Playlist album-cache to reduce annoying prompts
+        # key: album key (collection_id if possible else normalized album+artist)
+        # value: map norm_title -> TrackMeta from iTunes album track list
+        self._album_track_cache: Dict[str, Dict[str, TrackMeta]] = {}
+        self._album_key_for_cache: Optional[str] = None
+
     def _set(self, pct: int, text: str):
         self.progress_value.emit(int(max(0, min(100, pct))))
         self.progress_text.emit(text)
@@ -1676,6 +1818,7 @@ class PipelineWorker(QtCore.QObject):
             "yt_raw": yt_raw or "",
             "yt_parsed": f"{(yt_artist or '').strip()} — {(yt_title or '').strip()}".strip(" —"),
             "candidates": payload_candidates,
+            "default_source": "iTunes",  # ✅ your #3
         }
         self.review_needed.emit(payload)
 
@@ -1688,6 +1831,56 @@ class PipelineWorker(QtCore.QObject):
             chosen = candidates[sel]
 
         return chosen
+
+    def _album_cache_key_from_meta(self, m: TrackMeta) -> str:
+        if (m.itunes_collection_id or "").isdigit():
+            return f"itunes_collection:{m.itunes_collection_id}"
+        # fallback: album+artist
+        return f"album:{_norm(m.album)}|{_norm(m.album_artist or m.artist)}"
+
+    def _build_album_track_map_from_itunes(self, collection_id: str) -> Dict[str, TrackMeta]:
+        items = itunes_lookup_album_tracks(self.cs, collection_id)
+        track_map: Dict[str, TrackMeta] = {}
+        for it in items:
+            tm = meta_from_itunes_item(it)
+            tm.source = "iTunes"
+            tm.album = clean_album_name(tm.album)
+            # key by normalized title
+            if tm.title:
+                track_map[_norm(tm.title)] = tm
+        return track_map
+
+    def _try_autofill_from_album_cache(self, parsed_title: str) -> Optional[TrackMeta]:
+        """
+        If we've already confirmed an album (from a prior dialog),
+        and the parsed title exists in that album, return a strong iTunes TrackMeta
+        and skip the "Review Metadata" popup.
+        """
+        if not self._album_key_for_cache:
+            return None
+        key = self._album_key_for_cache
+        cache = self._album_track_cache.get(key) or {}
+        if not cache:
+            return None
+        tkey = _norm(parsed_title or "")
+        if not tkey:
+            return None
+
+        # direct match
+        if tkey in cache:
+            return TrackMeta(**cache[tkey].__dict__)
+
+        # small fuzzy fallback (token overlap) against album track titles
+        best = None
+        best_s = 0.0
+        for k, tm in cache.items():
+            s = token_jaccard(parsed_title, tm.title)
+            if s > best_s:
+                best_s = s
+                best = tm
+        if best and best_s >= 0.86:
+            return TrackMeta(**best.__dict__)
+        return None
 
     @QtCore.Slot()
     def run(self):
@@ -1723,6 +1916,10 @@ class PipelineWorker(QtCore.QObject):
             total = max(1, len(entries))
             folder_maybe_generic = (pl_title_line.strip().lower() == "playlist")
 
+            # ✅ NEW: Pre-parse titles list (cheap) for user goal #1
+            # We already have URLs here; actual titles still fetched per track,
+            # but album-based prompting is handled via cache during processing.
+
             for idx, vid_url in enumerate(entries, 1):
                 self._set_playlist_progress(total, idx, 0, "Starting…")
                 out_path, final_meta = self._process_single_video(
@@ -1734,6 +1931,19 @@ class PipelineWorker(QtCore.QObject):
                     progress_mapper=lambda sp, msg, _idx=idx: self._set_playlist_progress(total, _idx, sp, msg),
                 )
                 saved.append(out_path)
+
+                # If this track produced a strong album id, seed/refresh cache for that album.
+                # (This makes the next tracks in the same album skip the dialog automatically.)
+                if final_meta and (final_meta.itunes_collection_id or "").isdigit() and (final_meta.album or "").strip():
+                    alb_key = self._album_cache_key_from_meta(final_meta)
+                    self._album_key_for_cache = alb_key
+                    if alb_key not in self._album_track_cache:
+                        try:
+                            self._album_track_cache[alb_key] = self._build_album_track_map_from_itunes(
+                                final_meta.itunes_collection_id
+                            )
+                        except Exception:
+                            self._album_track_cache[alb_key] = {}
 
                 if folder_maybe_generic and idx == 1:
                     alb = sanitize_filename(final_meta.album or "")
@@ -1817,11 +2027,16 @@ class PipelineWorker(QtCore.QObject):
             base.track_number = str(playlist_index)
             base.track_total = str(playlist_total)
 
+        # ✅ NEW: If we're in playlist mode and already confirmed an album,
+        # and this title exists in that album, skip the Review dialog.
+        autofill = None
+        if playlist_total > 0 and playlist_index > 0:
+            autofill = self._try_autofill_from_album_cache(ft or base.title)
+
         # --------- Fetch ALL metadata sources first ----------
         set_stage(60, "Metadata: fetching sources…")
 
         sources: Dict[str, TrackMeta] = {}
-        shz_meta: Optional[TrackMeta] = None
 
         if not self.advanced:
             # Quick pipeline: iTunes + SpotAPI + JioSaavn
@@ -1861,14 +2076,16 @@ class PipelineWorker(QtCore.QObject):
                 work_dir=tmp_dir,
                 progress_cb=cb,
             )
-            if "Shazam" in sources:
-                shz_meta = sources["Shazam"]
 
             # merge into a current suggestion
             current_merged = TrackMeta(**base.__dict__)
             for k in ("SongLink", "Shazam", "iTunesBest", "SpotAPI", "JioSaavn"):
                 if k in sources:
-                    current_merged = merge_meta(current_merged, sources[k], prefer_incoming=True if k in ("iTunesBest", "Shazam") else False)
+                    current_merged = merge_meta(
+                        current_merged,
+                        sources[k],
+                        prefer_incoming=True if k in ("iTunesBest", "Shazam") else False,
+                    )
 
         current_merged.album = clean_album_name(current_merged.album)
         if not current_merged.album_artist:
@@ -1887,7 +2104,7 @@ class PipelineWorker(QtCore.QObject):
             m.comment = base.comment
             m.source = "iTunes"
 
-        # Build candidates list (deduped, with artwork prefetched)
+        # Build candidates list (deduped, merged, filtered)
         candidates = build_review_candidates(
             self.cs,
             yt_raw=yt_title,
@@ -1899,14 +2116,21 @@ class PipelineWorker(QtCore.QObject):
         )
 
         # --------- Review dialog AFTER fetching ----------
-        set_stage(72, "Review Metadata…")
-        chosen = self._request_review_blocking(
-            yt_raw=yt_title,
-            yt_artist=fa,
-            yt_title=ft or yt_title,
-            candidates=candidates,
-        )
-        chosen.comment = base.comment
+        chosen: TrackMeta
+        if autofill and (autofill.title and autofill.artist and autofill.album):
+            # ✅ Skip dialog for same album track
+            set_stage(72, "Metadata: auto-matched (same album)…")
+            chosen = TrackMeta(**autofill.__dict__)
+            chosen.comment = base.comment
+        else:
+            set_stage(72, "Review Metadata…")
+            chosen = self._request_review_blocking(
+                yt_raw=yt_title,
+                yt_artist=fa,
+                yt_title=ft or yt_title,
+                candidates=candidates,
+            )
+            chosen.comment = base.comment
 
         # --------- Post-selection: match & enrich, dedupe ----------
         set_stage(78, "Metadata: applying selection…")
@@ -1923,6 +2147,17 @@ class PipelineWorker(QtCore.QObject):
         if playlist_total > 0 and playlist_index > 0:
             final_meta.track_number = str(playlist_index)
             final_meta.track_total = str(playlist_total)
+
+        # ✅ After final_meta chosen, if it has album collection id, build cache for future tracks
+        if (final_meta.itunes_collection_id or "").isdigit() and (final_meta.album or "").strip():
+            alb_key = self._album_cache_key_from_meta(final_meta)
+            # set as current "active" album cache
+            self._album_key_for_cache = alb_key
+            if alb_key not in self._album_track_cache:
+                try:
+                    self._album_track_cache[alb_key] = self._build_album_track_map_from_itunes(final_meta.itunes_collection_id)
+                except Exception:
+                    self._album_track_cache[alb_key] = {}
 
         # ---------- Encode / Save ----------
         set_stage(82, "Encoding MP3…")
@@ -2259,6 +2494,7 @@ class ReviewDialog(QtWidgets.QDialog):
         self._candidates = payload.get("candidates", []) or []
         yt_raw = payload.get("yt_raw", "")
         yt_parsed = payload.get("yt_parsed", "")
+        self._default_source = (payload.get("default_source") or "iTunes").strip()
 
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(14, 14, 14, 14)
@@ -2326,10 +2562,24 @@ class ReviewDialog(QtWidgets.QDialog):
         root.addLayout(preview)
         root.addLayout(btns)
 
-        if self.combo.count() > 0:
-            self.combo.setCurrentIndex(0)
+        # ✅ Default option should be iTunes (your #3)
         self._chosen_key = "0"
+        self._select_default_source()
         self._update_preview()
+
+    def _select_default_source(self):
+        if self.combo.count() <= 0:
+            self.combo.setCurrentIndex(0)
+            return
+
+        want = self._default_source.lower().strip()
+        best_idx = 0
+        for i, c in enumerate(self._candidates):
+            src = (c.get("source") or "").lower().strip()
+            if src == want:
+                best_idx = i
+                break
+        self.combo.setCurrentIndex(best_idx)
 
     def _candidate_at_current(self) -> dict:
         idx = self.combo.currentIndex()
