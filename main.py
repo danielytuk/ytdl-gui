@@ -554,6 +554,16 @@ def songlink_extract_itunes_id(payload: Dict[str, Any]) -> str:
     return ""
 
 
+def token_jaccard(a: str, b: str) -> float:
+    ta = set(_norm(a).split())
+    tb = set(_norm(b).split())
+    if not ta and not tb:
+        return 1.0
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / max(1, len(ta | tb))
+
+
 def pick_best_itunes_result(results: List[Dict[str, Any]], want_artist: str, want_title: str) -> Optional[Dict[str, Any]]:
     wa = _norm(want_artist)
     wt = _norm(want_title)
@@ -565,7 +575,6 @@ def pick_best_itunes_result(results: List[Dict[str, Any]], want_artist: str, wan
         a = _norm(item.get("artistName", ""))
         t = _norm(item.get("trackName", ""))
 
-        # Hard-ish guard: if title similarity is extremely low, de-prioritize strongly
         title_sim = token_jaccard(want_title, item.get("trackName", "") or "")
         score = 0
 
@@ -582,7 +591,6 @@ def pick_best_itunes_result(results: List[Dict[str, Any]], want_artist: str, wan
         if "karaoke" in t:
             score -= 2
 
-        # Penalize big mismatch with the YouTube title
         if title_sim < 0.20 and wt:
             score -= 8
         elif title_sim < 0.35 and wt:
@@ -791,7 +799,6 @@ def spotapi_quick_search(artist: str, title: str) -> Optional[TrackMeta]:
         if want_a and arts == want_a:
             s += 3
 
-        # Penalize huge title mismatch vs expected
         if want_t:
             ts = token_jaccard(q_title, t.get("name") or t.get("title") or "")
             if ts < 0.20:
@@ -1173,10 +1180,13 @@ def merge_meta(base: TrackMeta, incoming: TrackMeta, prefer_incoming: bool = Tru
     ):
         a = getattr(out, field)
         b = getattr(incoming, field)
+
         if prefer_incoming:
+            # fill empties
             if b and not a:
                 setattr(out, field, b)
-            elif b and a and field in ("album", "year", "genre", "itunes_track_id", "artwork_url"):
+            # allow "strong" fields to upgrade even when already present
+            elif b and a and field in ("album", "year", "genre", "itunes_track_id", "artwork_url", "isrc"):
                 setattr(out, field, b)
         else:
             if not a and b:
@@ -1191,224 +1201,6 @@ def merge_meta(base: TrackMeta, incoming: TrackMeta, prefer_incoming: bool = Tru
     return out
 
 
-# -------- Review / mismatch detection --------
-def token_jaccard(a: str, b: str) -> float:
-    ta = set(_norm(a).split())
-    tb = set(_norm(b).split())
-    if not ta and not tb:
-        return 1.0
-    if not ta or not tb:
-        return 0.0
-    return len(ta & tb) / max(1, len(ta | tb))
-
-
-def needs_review(yt_artist: str, yt_title: str, meta_artist: str, meta_title: str) -> bool:
-    if not (yt_title or yt_artist):
-        return False
-
-    title_sim = token_jaccard(yt_title, meta_title)
-    artist_sim = token_jaccard(yt_artist, meta_artist) if yt_artist and meta_artist else 1.0
-
-    if title_sim < 0.45:
-        return True
-    if title_sim < 0.60 and artist_sim < 0.55:
-        return True
-    return False
-
-
-def format_meta_line(m: TrackMeta) -> str:
-    a = (m.artist or "").strip()
-    t = (m.title or "").strip()
-    alb = (m.album or "").strip()
-    src = (m.source or "").strip()
-    base = f"{a} — {t}".strip(" —")
-    if alb:
-        base += f"  |  {alb}"
-    if src:
-        base += f"  ({src})"
-    return base or "Unknown"
-
-
-def itunes_candidates(cs: CooldownSession, artist: str, title: str, limit: int = 6) -> List[TrackMeta]:
-    out: List[TrackMeta] = []
-    terms = itunes_search_variants(artist, title)
-    for term in terms[:2]:
-        try:
-            data = itunes_search(cs, term, limit=limit)
-            res = data.get("results") or []
-            for item in res:
-                if isinstance(item, dict) and item.get("trackName") and item.get("artistName"):
-                    tm = meta_from_itunes_item(item)
-                    # Light guard: keep candidates that resemble the YT title at least a bit
-                    if title and token_jaccard(title, tm.title) < 0.18:
-                        continue
-                    out.append(tm)
-        except Exception:
-            continue
-        if len(out) >= limit:
-            break
-    seen = set()
-    ded: List[TrackMeta] = []
-    for m in out:
-        k = f"{_norm(m.artist)}|{_norm(m.title)}"
-        if k in seen:
-            continue
-        seen.add(k)
-        ded.append(m)
-    return ded[:limit]
-
-
-# Metadata pipelines
-def quick_itunes_enrich(cs: CooldownSession, base: TrackMeta) -> TrackMeta:
-    meta = TrackMeta(**base.__dict__)
-    chosen: Optional[Dict[str, Any]] = None
-
-    if meta.isrc:
-        try:
-            data = itunes_search(cs, f"isrc:{meta.isrc}", limit=8)
-            res = data.get("results") or []
-            if res:
-                chosen = res[0]
-        except Exception:
-            pass
-
-    if not chosen and meta.artist and meta.title:
-        terms = itunes_search_variants(meta.artist, meta.title)
-        if terms:
-            try:
-                data = itunes_search(cs, terms[0], limit=10)
-                res = data.get("results") or []
-                if res:
-                    chosen = pick_best_itunes_result(res, meta.artist, meta.title) or res[0]
-            except Exception:
-                pass
-
-    if chosen:
-        filled = meta_from_itunes_item(chosen)
-        meta = merge_meta(meta, filled, prefer_incoming=True)
-        if meta.itunes_track_id:
-            try:
-                data = itunes_lookup(cs, meta.itunes_track_id)
-                res = data.get("results") or []
-                if res:
-                    meta = merge_meta(meta, meta_from_itunes_item(res[0]), prefer_incoming=True)
-            except Exception:
-                pass
-
-        if meta.artwork_url and not meta.artwork_jpeg:
-            try:
-                meta.artwork_jpeg = download_artwork(cs, meta.artwork_url)
-            except Exception:
-                meta.artwork_jpeg = b""
-
-    meta.album = clean_album_name(meta.album)
-    if not meta.album_artist:
-        meta.album_artist = meta.artist or ""
-    meta.source = meta.source or "iTunes"
-    return meta
-
-
-def advanced_enrich(
-    cs: CooldownSession,
-    youtube_url: str,
-    base_from_title: TrackMeta,
-    wav_path: Path,
-    work_dir: Path,
-    progress_cb,
-) -> Tuple[TrackMeta, Optional[TrackMeta]]:
-    """
-    Returns (final_meta, shazam_meta_if_any)
-    """
-    meta = TrackMeta(**base_from_title.__dict__)
-    shz_meta: Optional[TrackMeta] = None
-
-    progress_cb("song.link: resolving…")
-    try:
-        payload = songlink_lookup(cs, youtube_url)
-        it_id = songlink_extract_itunes_id(payload)
-        if it_id:
-            meta.itunes_track_id = it_id
-    except Exception:
-        pass
-
-    progress_cb("Shazam: matching…")
-    shz = shazam_best_guess_from_wav(wav_path, work_dir, progress_cb)
-    if shz.title or shz.artist or shz.isrc:
-        shz.comment = meta.comment
-        meta = merge_meta(meta, shz, prefer_incoming=True)
-        shz_meta = shz
-
-    progress_cb("iTunes: searching…")
-    chosen: Optional[Dict[str, Any]] = None
-    if meta.isrc:
-        try:
-            data = itunes_search(cs, f"isrc:{meta.isrc}", limit=10)
-            res = data.get("results") or []
-            if res:
-                chosen = res[0]
-        except Exception:
-            pass
-
-    if not chosen and meta.artist and meta.title:
-        for term in itunes_search_variants(meta.artist, meta.title):
-            try:
-                data = itunes_search(cs, term, limit=15)
-                res = data.get("results") or []
-                if not res:
-                    continue
-                picked = pick_best_itunes_result(res, meta.artist, meta.title)
-                if picked:
-                    chosen = picked
-                    break
-            except Exception:
-                continue
-
-    if chosen:
-        meta = merge_meta(meta, meta_from_itunes_item(chosen), prefer_incoming=True)
-        if meta.artwork_url and not meta.artwork_jpeg:
-            try:
-                meta.artwork_jpeg = download_artwork(cs, meta.artwork_url)
-            except Exception:
-                meta.artwork_jpeg = b""
-
-    progress_cb("song.link: confirming…")
-    try:
-        payload = songlink_lookup(cs, youtube_url)
-        it2 = songlink_extract_itunes_id(payload)
-        if it2:
-            meta.itunes_track_id = it2
-    except Exception:
-        pass
-
-    progress_cb("Spotify (SpotAPI): searching…")
-    sp = spotapi_quick_search(meta.artist, meta.title)
-    if sp:
-        sp.comment = meta.comment
-        meta = merge_meta(meta, sp, prefer_incoming=False)
-
-    progress_cb("iTunes: lookup…")
-    if meta.itunes_track_id:
-        try:
-            data = itunes_lookup(cs, meta.itunes_track_id)
-            res = data.get("results") or []
-            if res:
-                meta = merge_meta(meta, meta_from_itunes_item(res[0]), prefer_incoming=True)
-        except Exception:
-            pass
-
-    progress_cb("JioSaavn: searching…")
-    js = jiosaavn_search(cs, f"{meta.artist} {meta.title}".strip())
-    if js:
-        js.comment = meta.comment
-        meta = merge_meta(meta, js, prefer_incoming=False)
-
-    meta.album = clean_album_name(meta.album)
-    if not meta.album_artist:
-        meta.album_artist = meta.artist or ""
-    return meta, shz_meta
-
-
-# Copy/save helpers
 def downloads_dir() -> Path:
     return Path(os.environ.get("USERPROFILE", str(Path.home()))) / "Downloads"
 
@@ -1508,6 +1300,295 @@ def check_internet_required() -> None:
         )
 
 
+def itunes_candidates(cs: CooldownSession, artist: str, title: str, limit: int = 6) -> List[TrackMeta]:
+    out: List[TrackMeta] = []
+    terms = itunes_search_variants(artist, title)
+    for term in terms[:2]:
+        try:
+            data = itunes_search(cs, term, limit=limit)
+            res = data.get("results") or []
+            for item in res:
+                if isinstance(item, dict) and item.get("trackName") and item.get("artistName"):
+                    tm = meta_from_itunes_item(item)
+                    if title and token_jaccard(title, tm.title) < 0.18:
+                        continue
+                    out.append(tm)
+        except Exception:
+            continue
+        if len(out) >= limit:
+            break
+    seen = set()
+    ded: List[TrackMeta] = []
+    for m in out:
+        k = f"{_norm(m.artist)}|{_norm(m.title)}|{_norm(m.album)}"
+        if k in seen:
+            continue
+        seen.add(k)
+        ded.append(m)
+    return ded[:limit]
+
+
+def ensure_artwork(cs: CooldownSession, m: TrackMeta) -> TrackMeta:
+    if m.artwork_jpeg:
+        return m
+    if m.artwork_url:
+        try:
+            m.artwork_jpeg = download_artwork(cs, m.artwork_url)
+        except Exception:
+            m.artwork_jpeg = b""
+    return m
+
+
+def meta_match(a: TrackMeta, b: TrackMeta) -> bool:
+    # Strong IDs
+    if a.isrc and b.isrc and a.isrc.strip().upper() == b.isrc.strip().upper():
+        return True
+    if a.itunes_track_id and b.itunes_track_id and a.itunes_track_id == b.itunes_track_id:
+        return True
+
+    # Fallback similarity
+    ts = token_jaccard(a.title, b.title)
+    asim = token_jaccard(a.artist, b.artist) if a.artist and b.artist else 0.6
+    return ts >= 0.62 and asim >= 0.55
+
+
+def format_candidate_label(m: TrackMeta) -> str:
+    a = (m.artist or "").strip()
+    t = (m.title or "").strip()
+    src = (m.source or "").strip() or "Unknown"
+    base = f"{a} — {t}".strip(" —")
+    if not base:
+        base = "Unknown"
+    return f"{base} ({src})"
+
+
+def quick_itunes_enrich(cs: CooldownSession, base: TrackMeta) -> TrackMeta:
+    meta = TrackMeta(**base.__dict__)
+    chosen: Optional[Dict[str, Any]] = None
+
+    if meta.isrc:
+        try:
+            data = itunes_search(cs, f"isrc:{meta.isrc}", limit=8)
+            res = data.get("results") or []
+            if res:
+                chosen = res[0]
+        except Exception:
+            pass
+
+    if not chosen and meta.artist and meta.title:
+        terms = itunes_search_variants(meta.artist, meta.title)
+        if terms:
+            try:
+                data = itunes_search(cs, terms[0], limit=10)
+                res = data.get("results") or []
+                if res:
+                    chosen = pick_best_itunes_result(res, meta.artist, meta.title) or res[0]
+            except Exception:
+                pass
+
+    if chosen:
+        filled = meta_from_itunes_item(chosen)
+        meta = merge_meta(meta, filled, prefer_incoming=True)
+        if meta.itunes_track_id:
+            try:
+                data = itunes_lookup(cs, meta.itunes_track_id)
+                res = data.get("results") or []
+                if res:
+                    meta = merge_meta(meta, meta_from_itunes_item(res[0]), prefer_incoming=True)
+            except Exception:
+                pass
+
+        meta = ensure_artwork(cs, meta)
+
+    meta.album = clean_album_name(meta.album)
+    if not meta.album_artist:
+        meta.album_artist = meta.artist or ""
+    meta.source = meta.source or "iTunes"
+    return meta
+
+
+def advanced_enrich_all_sources(
+    cs: CooldownSession,
+    youtube_url: str,
+    base_from_title: TrackMeta,
+    wav_path: Path,
+    work_dir: Path,
+    progress_cb,
+) -> Dict[str, TrackMeta]:
+    """
+    Returns a dict of source metas (best-effort):
+      - YouTubeTitle
+      - SongLink (just fills itunes_track_id if found)
+      - Shazam
+      - iTunesBest (search/lookup best)
+      - SpotAPI
+      - JioSaavn
+    """
+    sources: Dict[str, TrackMeta] = {}
+
+    base = TrackMeta(**base_from_title.__dict__)
+    base.source = "YouTubeTitle"
+    sources["YouTubeTitle"] = base
+
+    # song.link
+    progress_cb("song.link: resolving…")
+    try:
+        payload = songlink_lookup(cs, youtube_url)
+        it_id = songlink_extract_itunes_id(payload)
+        if it_id:
+            sl = TrackMeta(**base.__dict__)
+            sl.itunes_track_id = it_id
+            sl.source = "SongLink"
+            sources["SongLink"] = sl
+    except Exception:
+        pass
+
+    # Shazam
+    progress_cb("Shazam: matching…")
+    try:
+        shz = shazam_best_guess_from_wav(wav_path, work_dir, progress_cb)
+        if shz.title or shz.artist or shz.isrc:
+            shz.comment = base.comment
+            shz.source = "Shazam"
+            sources["Shazam"] = shz
+    except Exception:
+        pass
+
+    # iTunes best (use ISRC if shazam gives it)
+    progress_cb("iTunes: searching…")
+    it_base = TrackMeta(**base.__dict__)
+    if "Shazam" in sources and sources["Shazam"].isrc:
+        it_base.isrc = sources["Shazam"].isrc
+    if "SongLink" in sources and sources["SongLink"].itunes_track_id:
+        it_base.itunes_track_id = sources["SongLink"].itunes_track_id
+
+    it_best = quick_itunes_enrich(cs, it_base)
+    if it_best.title or it_best.artist:
+        it_best.comment = base.comment
+        it_best.source = "iTunes"
+        sources["iTunesBest"] = it_best
+
+    # Spotify SpotAPI
+    progress_cb("Spotify (SpotAPI): searching…")
+    sp = spotapi_quick_search(it_best.artist or base.artist, it_best.title or base.title)
+    if sp:
+        sp.comment = base.comment
+        sp.source = "SpotAPI"
+        sources["SpotAPI"] = sp
+
+    # JioSaavn
+    progress_cb("JioSaavn: searching…")
+    js = jiosaavn_search(cs, f"{it_best.artist or base.artist} {it_best.title or base.title}".strip())
+    if js:
+        js.comment = base.comment
+        js.source = "JioSaavn"
+        sources["JioSaavn"] = js
+
+    return sources
+
+
+def build_review_candidates(
+    cs: CooldownSession,
+    yt_raw: str,
+    yt_artist: str,
+    yt_title: str,
+    base_current: TrackMeta,
+    source_metas: Dict[str, TrackMeta],
+    extra_itunes: List[TrackMeta],
+) -> List[TrackMeta]:
+    """
+    Build a deduped list of candidates for the combo box, with artwork prefetched where possible.
+    """
+    merged: List[TrackMeta] = []
+
+    # Current merged meta first
+    cur = TrackMeta(**base_current.__dict__)
+    cur.source = cur.source or "Current"
+    merged.append(cur)
+
+    # Parsed YT title candidate
+    yt_candidate = TrackMeta(
+        title=yt_title or (yt_raw or ""),
+        artist=yt_artist or "",
+        album_artist=yt_artist or "",
+        comment=base_current.comment,
+        source="YouTubeTitle",
+    )
+    merged.append(yt_candidate)
+
+    # Add each source meta
+    for key in ("iTunesBest", "Shazam", "SpotAPI", "JioSaavn", "SongLink"):
+        m = source_metas.get(key)
+        if m and (m.title or m.artist or m.itunes_track_id):
+            merged.append(TrackMeta(**m.__dict__))
+
+    # Extra iTunes candidates (search results)
+    for m in extra_itunes:
+        merged.append(TrackMeta(**m.__dict__))
+
+    # Dedup by artist+title+album+source-ish
+    seen = set()
+    out: List[TrackMeta] = []
+    for m in merged:
+        k = f"{_norm(m.artist)}|{_norm(m.title)}|{_norm(m.album)}|{_norm(m.source)}"
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(m)
+
+    # Prefetch artwork for top options so dialog can show it instantly
+    for m in out[:10]:
+        ensure_artwork(cs, m)
+
+    return out[:10]
+
+
+def enrich_after_user_choice(
+    cs: CooldownSession,
+    chosen: TrackMeta,
+    other_sources: List[TrackMeta],
+) -> TrackMeta:
+    """
+    Anchor to chosen, then enrich + dedupe:
+      - if iTunes ID exists: lookup
+      - else: iTunes search
+      - SpotAPI + JioSaavn
+      - merge matching sources to avoid unrelated overwrites
+    """
+    anchor = TrackMeta(**chosen.__dict__)
+
+    # Strong: iTunes lookup/search using anchor
+    it = quick_itunes_enrich(cs, anchor)
+    it.comment = anchor.comment
+    anchor = merge_meta(anchor, it, prefer_incoming=True)
+
+    # Try Spot/Jio based on anchor
+    sp = spotapi_quick_search(anchor.artist, anchor.title)
+    if sp:
+        sp.comment = anchor.comment
+        anchor = merge_meta(anchor, sp, prefer_incoming=False)
+
+    js = jiosaavn_search(cs, f"{anchor.artist} {anchor.title}".strip())
+    if js:
+        js.comment = anchor.comment
+        anchor = merge_meta(anchor, js, prefer_incoming=False)
+
+    # Merge in other sources if they look like the same track
+    for m in other_sources:
+        if not (m.title or m.artist or m.isrc or m.itunes_track_id):
+            continue
+        if meta_match(anchor, m):
+            anchor = merge_meta(anchor, m, prefer_incoming=False)
+
+    # Final artwork ensure
+    ensure_artwork(cs, anchor)
+
+    anchor.album = clean_album_name(anchor.album)
+    if not anchor.album_artist:
+        anchor.album_artist = anchor.artist or ""
+    return anchor
+
+
 # Worker: download + tag
 class PipelineWorker(QtCore.QObject):
     progress_text = QtCore.Signal(str)
@@ -1516,7 +1597,7 @@ class PipelineWorker(QtCore.QObject):
     finished = QtCore.Signal(list)  # list of saved output paths (strings)
 
     # Metadata review request to UI thread
-    review_needed = QtCore.Signal(dict)  # payload includes request_id + fields
+    review_needed = QtCore.Signal(dict)  # payload includes request_id + candidates details
 
     def __init__(self, url: str, advanced: bool, playlist_mode: str):
         super().__init__()
@@ -1532,6 +1613,9 @@ class PipelineWorker(QtCore.QObject):
         self._review_selected_index: int = 0
         self._review_request_id: str = ""
 
+        # Store candidates for current review request
+        self._review_candidates: List[TrackMeta] = []
+
     def _set(self, pct: int, text: str):
         self.progress_value.emit(int(max(0, min(100, pct))))
         self.progress_text.emit(text)
@@ -1544,6 +1628,8 @@ class PipelineWorker(QtCore.QObject):
 
     @QtCore.Slot(str, str, object)
     def receive_review_result(self, request_id: str, chosen_key: str, _unused: object = None):
+        # IMPORTANT: This must run even while worker thread is "busy".
+        # We connect via DirectConnection in the UI to avoid deadlock.
         with self._review_lock:
             if not self._review_event or request_id != self._review_request_id:
                 return
@@ -1559,62 +1645,48 @@ class PipelineWorker(QtCore.QObject):
         yt_artist: str,
         yt_title: str,
         candidates: List[TrackMeta],
-        current: TrackMeta,
     ) -> TrackMeta:
-        merged: List[TrackMeta] = []
-        merged.append(current)
-
-        yt_candidate = TrackMeta(
-            title=yt_title or (yt_raw or ""),
-            artist=yt_artist or "",
-            album_artist=yt_artist or "",
-            comment=current.comment,
-            source="YouTubeTitle",
-        )
-        merged.append(yt_candidate)
-
-        seen = set()
-        for m in merged:
-            seen.add(f"{_norm(m.artist)}|{_norm(m.title)}")
-        for m in candidates:
-            k = f"{_norm(m.artist)}|{_norm(m.title)}"
-            if k in seen:
-                continue
-            seen.add(k)
-            merged.append(m)
-
-        merged = merged[:10]
-
         request_id = f"rev_{int(time.time()*1000)}_{os.getpid()}"
         evt = threading.Event()
+
         with self._review_lock:
             self._review_request_id = request_id
             self._review_event = evt
             self._review_selected_index = 0
+            self._review_candidates = candidates
+
+        # Build payload with detail fields for UI
+        payload_candidates = []
+        for i, m in enumerate(candidates):
+            payload_candidates.append(
+                {
+                    "idx": i,
+                    "label": format_candidate_label(m),
+                    "title": m.title,
+                    "artist": m.artist,
+                    "album": m.album,
+                    "year": m.year,
+                    "source": m.source,
+                    "artwork_jpeg": m.artwork_jpeg,  # raw bytes (Qt can load)
+                }
+            )
 
         payload = {
             "request_id": request_id,
             "yt_raw": yt_raw or "",
             "yt_parsed": f"{(yt_artist or '').strip()} — {(yt_title or '').strip()}".strip(" —"),
-            "candidates": [format_meta_line(m) for m in merged],
+            "candidates": payload_candidates,
         }
         self.review_needed.emit(payload)
 
-        evt.wait()
+        evt.wait()  # safe now (DirectConnection sets event without needing worker event loop)
 
         with self._review_lock:
-            sel = max(0, min(len(merged) - 1, self._review_selected_index))
+            sel = max(0, min(len(candidates) - 1, self._review_selected_index))
             self._review_event = None
             self._review_request_id = ""
-            chosen = merged[sel]
+            chosen = candidates[sel]
 
-        chosen.comment = current.comment
-        if not chosen.album_artist:
-            chosen.album_artist = chosen.artist or ""
-        if current.artwork_jpeg and not chosen.artwork_jpeg:
-            chosen.artwork_jpeg = current.artwork_jpeg
-        if current.artwork_url and not chosen.artwork_url:
-            chosen.artwork_url = current.artwork_url
         return chosen
 
     @QtCore.Slot()
@@ -1716,7 +1788,6 @@ class PipelineWorker(QtCore.QObject):
             else:
                 self._set(stage_pct, msg)
 
-        # ---- Stage: Title + channel (NEW: use channel name when title has no artist) ----
         set_stage(8, "Fetching title…")
         yt_title, yt_channel = self._ytdlp_get_title_and_uploader(url, allow_playlist=allow_playlist)
 
@@ -1731,8 +1802,6 @@ class PipelineWorker(QtCore.QObject):
         fa = (fa or "").strip()
         ft = (ft or "").strip()
 
-        # If title looks like just a song name (no "Artist - Title"), use channel/uploader as artist.
-        # This ensures metadata searches are aligned with the YouTube title context.
         if not fa:
             fa = (yt_channel or "").strip()
 
@@ -1748,18 +1817,35 @@ class PipelineWorker(QtCore.QObject):
             base.track_number = str(playlist_index)
             base.track_total = str(playlist_total)
 
-        set_stage(60, "Metadata: resolving…")
-        final_meta = TrackMeta(**base.__dict__)
+        # --------- Fetch ALL metadata sources first ----------
+        set_stage(60, "Metadata: fetching sources…")
+
+        sources: Dict[str, TrackMeta] = {}
         shz_meta: Optional[TrackMeta] = None
 
         if not self.advanced:
-            enriched = quick_itunes_enrich(self.cs, final_meta)
-            final_meta = merge_meta(final_meta, enriched, prefer_incoming=True)
+            # Quick pipeline: iTunes + SpotAPI + JioSaavn
+            it = quick_itunes_enrich(self.cs, base)
+            it.comment = base.comment
+            sources["iTunesBest"] = it
 
-            sp = spotapi_quick_search(final_meta.artist, final_meta.title)
+            sp = spotapi_quick_search(it.artist or base.artist, it.title or base.title)
             if sp:
-                sp.comment = final_meta.comment
-                final_meta = merge_meta(final_meta, sp, prefer_incoming=False)
+                sp.comment = base.comment
+                sources["SpotAPI"] = sp
+
+            js = jiosaavn_search(self.cs, f"{it.artist or base.artist} {it.title or base.title}".strip())
+            if js:
+                js.comment = base.comment
+                sources["JioSaavn"] = js
+
+            sources["YouTubeTitle"] = base
+            current_merged = TrackMeta(**base.__dict__)
+            current_merged = merge_meta(current_merged, it, prefer_incoming=True)
+            if sp:
+                current_merged = merge_meta(current_merged, sp, prefer_incoming=False)
+            if js:
+                current_merged = merge_meta(current_merged, js, prefer_incoming=False)
         else:
             def cb(msg: str):
                 if playlist_total > 0 and playlist_index > 0:
@@ -1767,57 +1853,78 @@ class PipelineWorker(QtCore.QObject):
                 else:
                     self.progress_text.emit(msg)
 
-            final_meta, shz_meta = advanced_enrich(
+            sources = advanced_enrich_all_sources(
                 self.cs,
                 youtube_url=url,
-                base_from_title=final_meta,
+                base_from_title=base,
                 wav_path=wav_path,
                 work_dir=tmp_dir,
                 progress_cb=cb,
             )
+            if "Shazam" in sources:
+                shz_meta = sources["Shazam"]
 
-        final_meta.album = clean_album_name(final_meta.album)
-        if not final_meta.album_artist:
-            final_meta.album_artist = final_meta.artist or ""
+            # merge into a current suggestion
+            current_merged = TrackMeta(**base.__dict__)
+            for k in ("SongLink", "Shazam", "iTunesBest", "SpotAPI", "JioSaavn"):
+                if k in sources:
+                    current_merged = merge_meta(current_merged, sources[k], prefer_incoming=True if k in ("iTunesBest", "Shazam") else False)
+
+        current_merged.album = clean_album_name(current_merged.album)
+        if not current_merged.album_artist:
+            current_merged.album_artist = current_merged.artist or ""
 
         if playlist_total > 0 and playlist_index > 0:
-            final_meta.track_number = str(playlist_index)
-            final_meta.track_total = str(playlist_total)
+            current_merged.track_number = str(playlist_index)
+            current_merged.track_total = str(playlist_total)
 
-        # ---- NEW: Always presume metadata might be wrong; always offer Review Metadata UI ----
-        # We still compute mismatch to help stage text, but we ALWAYS let the user choose.
-        mismatch = needs_review(fa, ft or yt_title, final_meta.artist, final_meta.title)
+        # Extra iTunes candidates keyed to what user saw on YouTube
+        set_stage(70, "Metadata: preparing review…")
+        want_artist = fa or current_merged.artist
+        want_title = ft or current_merged.title
+        extra_it = itunes_candidates(self.cs, want_artist, want_title, limit=6)
+        for m in extra_it:
+            m.comment = base.comment
+            m.source = "iTunes"
 
-        set_stage(72, "Reviewing metadata…" if mismatch else "Confirming metadata…")
+        # Build candidates list (deduped, with artwork prefetched)
+        candidates = build_review_candidates(
+            self.cs,
+            yt_raw=yt_title,
+            yt_artist=fa,
+            yt_title=ft or yt_title,
+            base_current=current_merged,
+            source_metas=sources,
+            extra_itunes=extra_it,
+        )
 
-        cands: List[TrackMeta] = []
-        if shz_meta and (shz_meta.title or shz_meta.artist):
-            cands.append(shz_meta)
-
-        # Candidate search should be keyed to what the user saw on YouTube
-        # (artist from parsed title, or uploader fallback) + parsed/clean title.
-        want_artist = fa or final_meta.artist
-        want_title = ft or final_meta.title
-        cands.extend(itunes_candidates(self.cs, want_artist, want_title, limit=6))
-
+        # --------- Review dialog AFTER fetching ----------
+        set_stage(72, "Review Metadata…")
         chosen = self._request_review_blocking(
             yt_raw=yt_title,
             yt_artist=fa,
             yt_title=ft or yt_title,
-            candidates=cands,
-            current=final_meta,
+            candidates=candidates,
         )
-        if chosen.artwork_url and not chosen.artwork_jpeg:
-            try:
-                chosen.artwork_jpeg = download_artwork(self.cs, chosen.artwork_url)
-            except Exception:
-                chosen.artwork_jpeg = b""
-        final_meta = merge_meta(final_meta, chosen, prefer_incoming=True)
+        chosen.comment = base.comment
+
+        # --------- Post-selection: match & enrich, dedupe ----------
+        set_stage(78, "Metadata: applying selection…")
+        others: List[TrackMeta] = []
+        for m in candidates:
+            if m is chosen:
+                continue
+            others.append(m)
+        for m in sources.values():
+            others.append(m)
+
+        final_meta = enrich_after_user_choice(self.cs, chosen, others)
 
         if playlist_total > 0 and playlist_index > 0:
             final_meta.track_number = str(playlist_index)
             final_meta.track_total = str(playlist_total)
 
+        # ---------- Encode / Save ----------
         set_stage(82, "Encoding MP3…")
         mp3_tmp = tmp_dir / "final.mp3"
         wav_to_mp3_high_compat(wav_path, mp3_tmp)
@@ -1841,7 +1948,6 @@ class PipelineWorker(QtCore.QObject):
     # ----- yt-dlp helpers -----
 
     def _ytdlp_common_base_args(self) -> List[str]:
-        # Conservative “more likely to work” defaults; kept small to avoid breaking normal cases.
         return [
             str(YTDLP_PATH),
             "--no-warnings",
@@ -1859,11 +1965,6 @@ class PipelineWorker(QtCore.QObject):
         ]
 
     def _ytdlp_get_title_and_uploader(self, url: str, allow_playlist: bool) -> Tuple[str, str]:
-        """
-        NEW: fetch both title and uploader/channel name.
-        Also includes multiple fallbacks when yt-dlp fails (client variants, no js-runtime).
-        """
-        # Try a few approaches in order
         tries: List[List[str]] = []
 
         def add_try(extra: Optional[List[str]] = None, use_js: bool = True):
@@ -1885,13 +1986,9 @@ class PipelineWorker(QtCore.QObject):
             args.append(url)
             tries.append(args)
 
-        # Normal
         add_try(extra=None, use_js=True)
-
-        # No js-runtime (some environments fail with deno/js)
         add_try(extra=None, use_js=False)
 
-        # Player client fallbacks
         for c in ("android", "ios", "tv", "web,android"):
             add_try(extra=["--extractor-args", f"youtube:player_client={c}"], use_js=True)
             add_try(extra=["--extractor-args", f"youtube:player_client={c}"], use_js=False)
@@ -1929,7 +2026,6 @@ class PipelineWorker(QtCore.QObject):
         if not allow_playlist:
             args.append("--no-playlist")
 
-        # Prefer deno runtime when available, but allow disabling as a fallback.
         if use_js_runtime and DENO_PATH.exists():
             args.extend(["--js-runtime", str(DENO_PATH)])
 
@@ -1958,15 +2054,6 @@ class PipelineWorker(QtCore.QObject):
         )
 
     def _download_audio_with_fallbacks(self, url: str, dl_dir: Path, allow_playlist: bool) -> Path:
-        """
-        Improved fallbacks:
-          1) Normal yt-dlp (with js-runtime)
-          2) yt-dlp without js-runtime (deno issues)
-          3) yt-dlp with alternate player clients (with/without js-runtime)
-          4) “network-ish” robustness toggles (ipv4, geo-bypass, no-check-certificate) + clients
-          5) API fallbacks (Piped, Invidious) for bot-wall/403 scenarios
-        """
-        # Helpers: clear partials between tries
         def clear_dir():
             for f in dl_dir.glob("*"):
                 try:
@@ -1974,7 +2061,6 @@ class PipelineWorker(QtCore.QObject):
                 except Exception:
                     pass
 
-        # 1) Normal
         try:
             return self._ytdlp_download_audio(url, dl_dir, allow_playlist=allow_playlist, use_js_runtime=True)
         except AppError as e:
@@ -1982,14 +2068,12 @@ class PipelineWorker(QtCore.QObject):
         except Exception as e:
             first_msg = str(e)
 
-        # 2) No js-runtime (deno/js failures, env oddities)
         try:
             clear_dir()
             return self._ytdlp_download_audio(url, dl_dir, allow_playlist=allow_playlist, use_js_runtime=False)
         except AppError:
             pass
 
-        # 3) Player client fallbacks (with and without js-runtime)
         client_variants = [
             ["--extractor-args", "youtube:player_client=android"],
             ["--extractor-args", "youtube:player_client=ios"],
@@ -2006,7 +2090,6 @@ class PipelineWorker(QtCore.QObject):
                 except AppError:
                     continue
 
-        # 4) Network-ish toggles (sometimes helps intermittent TLS/DNS/route problems)
         net_toggles = ["--force-ipv4", "--geo-bypass", "--no-check-certificate"]
         for extra in client_variants + [None]:
             for use_js in (True, False):
@@ -2022,13 +2105,10 @@ class PipelineWorker(QtCore.QObject):
                 except AppError:
                     continue
 
-        # 5) API fallbacks for botwall/403-like errors (best-effort)
         if self._looks_like_ytdlp_botwall_or_403(first_msg):
             vid = extract_youtube_id(url)
             if not vid:
-                raise AppError(
-                    "Download failed (YouTube rate-limits)"
-                )
+                raise AppError("Download failed (YouTube rate-limits)")
 
             try:
                 p = self._piped_pick_audio_url(vid)
@@ -2044,7 +2124,6 @@ class PipelineWorker(QtCore.QObject):
             except Exception:
                 pass
 
-        # If nothing worked, show a stronger, more actionable message while keeping your UI unchanged.
         raise AppError(
             "Download failed after multiple fallbacks.\n\n"
             "Common causes:\n"
@@ -2125,11 +2204,6 @@ class PipelineWorker(QtCore.QObject):
         return best_url
 
     def _ytdlp_list_playlist(self, url: str) -> Tuple[str, List[str]]:
-        """
-        Fixes:
-          - Duplicate playlist folder names (title repetition): read a single JSON, not printed lines.
-          - Generic playlist folder name: prefer playlist title, else fallback.
-        """
         try:
             out, _ = run_cmd(
                 [
@@ -2190,7 +2264,7 @@ class ReviewDialog(QtWidgets.QDialog):
         root.setContentsMargins(14, 14, 14, 14)
         root.setSpacing(10)
 
-        lbl = QtWidgets.QLabel("Metadata mismatch detected. Please confirm the correct track:")
+        lbl = QtWidgets.QLabel("Please confirm the correct track (details update when you change selection):")
         lbl.setWordWrap(True)
 
         yt1 = QtWidgets.QLabel(f"<b>Original YouTube title:</b><br>{html.escape(yt_raw)}")
@@ -2199,32 +2273,94 @@ class ReviewDialog(QtWidgets.QDialog):
         yt2.setWordWrap(True)
 
         self.combo = QtWidgets.QComboBox()
-        for i, line in enumerate(self._candidates):
-            self.combo.addItem(line, userData=str(i))
+        for item in self._candidates:
+            self.combo.addItem(item.get("label", "Unknown"), userData=str(item.get("idx", 0)))
+
+        # Preview area
+        preview = QtWidgets.QHBoxLayout()
+        preview.setSpacing(12)
+
+        self.art = QtWidgets.QLabel()
+        self.art.setFixedSize(96, 96)
+        self.art.setScaledContents(True)
+        self.art.setStyleSheet("border: 1px solid #2A3042; border-radius: 10px; background: #0F1320;")
+
+        info_col = QtWidgets.QVBoxLayout()
+        info_col.setSpacing(4)
+
+        self.info_title = QtWidgets.QLabel("")
+        self.info_artist = QtWidgets.QLabel("")
+        self.info_album = QtWidgets.QLabel("")
+        self.info_year = QtWidgets.QLabel("")
+        self.info_source = QtWidgets.QLabel("")
+        for w in (self.info_title, self.info_artist, self.info_album, self.info_year, self.info_source):
+            w.setWordWrap(True)
+
+        info_col.addWidget(self.info_title)
+        info_col.addWidget(self.info_artist)
+        info_col.addWidget(self.info_album)
+        info_col.addWidget(self.info_year)
+        info_col.addWidget(self.info_source)
+        info_col.addStretch(1)
+
+        preview.addWidget(self.art)
+        preview.addLayout(info_col)
 
         btns = QtWidgets.QHBoxLayout()
         btns.addStretch(1)
         ok = QtWidgets.QPushButton("Use Selection")
-        cancel = QtWidgets.QPushButton("Cancel (keep current)")
+        cancel = QtWidgets.QPushButton("Cancel (keep first)")
         btns.addWidget(cancel)
         btns.addWidget(ok)
 
         ok.clicked.connect(self.accept)
-        cancel.clicked.connect(self._cancel_keep_current)
+        cancel.clicked.connect(self._cancel_keep_first)
+
+        self.combo.currentIndexChanged.connect(self._update_preview)
 
         root.addWidget(lbl)
         root.addWidget(yt1)
         root.addWidget(yt2)
         root.addWidget(QtWidgets.QLabel("<b>Choose match:</b>"))
         root.addWidget(self.combo)
+        root.addLayout(preview)
         root.addLayout(btns)
 
         if self.combo.count() > 0:
             self.combo.setCurrentIndex(0)
-
         self._chosen_key = "0"
+        self._update_preview()
 
-    def _cancel_keep_current(self):
+    def _candidate_at_current(self) -> dict:
+        idx = self.combo.currentIndex()
+        if idx < 0 or idx >= len(self._candidates):
+            return {}
+        return self._candidates[idx]
+
+    def _update_preview(self):
+        c = self._candidate_at_current()
+        title = (c.get("title") or "").strip()
+        artist = (c.get("artist") or "").strip()
+        album = (c.get("album") or "").strip()
+        year = (c.get("year") or "").strip()
+        source = (c.get("source") or "").strip()
+
+        self.info_title.setText(f"<b>Title:</b> {html.escape(title) if title else '—'}")
+        self.info_artist.setText(f"<b>Artist:</b> {html.escape(artist) if artist else '—'}")
+        self.info_album.setText(f"<b>Album:</b> {html.escape(album) if album else '—'}")
+        self.info_year.setText(f"<b>Release:</b> {html.escape(year) if year else '—'}")
+        self.info_source.setText(f"<b>Source:</b> {html.escape(source) if source else '—'}")
+
+        art_bytes = c.get("artwork_jpeg") or b""
+        if isinstance(art_bytes, (bytes, bytearray)) and art_bytes:
+            pix = QtGui.QPixmap()
+            pix.loadFromData(bytes(art_bytes))
+            if not pix.isNull():
+                self.art.setPixmap(pix)
+                return
+        self.art.setPixmap(QtGui.QPixmap())  # clear
+
+    def _cancel_keep_first(self):
         self._chosen_key = "0"
         self.reject()
 
@@ -2244,7 +2380,7 @@ class ReviewDialog(QtWidgets.QDialog):
 
 # UI: compact single-screen widget
 class MainWidget(QtWidgets.QWidget):
-    review_result = QtCore.Signal(str, str, object)  # request_id, chosen_key, unused (keeps signature stable)
+    review_result = QtCore.Signal(str, str, object)  # request_id, chosen_key, unused
 
     def __init__(self):
         super().__init__()
@@ -2443,7 +2579,9 @@ class MainWidget(QtWidgets.QWidget):
         self._worker.finished.connect(self._on_finished)
 
         self._worker.review_needed.connect(self._on_review_needed)
-        self.review_result.connect(self._worker.receive_review_result, QtCore.Qt.QueuedConnection)
+
+        # ✅ CRITICAL FIX: DirectConnection prevents deadlock (worker has no Qt event loop while running)
+        self.review_result.connect(self._worker.receive_review_result, QtCore.Qt.DirectConnection)
 
         self._thread.start()
 
