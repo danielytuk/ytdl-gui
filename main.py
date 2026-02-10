@@ -1,18 +1,21 @@
 # YTDL GUI - Windows-only (Python 3.12+)
 #
 # pip deps:
-# pip install PySide6 requests mutagen
+#   pip install PySide6 requests mutagen
 #
-# pip install shazamio (Optional / Advanced metadata)
-# pip install spotapi (Optional / Spotify)
+# Optional:
+#   pip install shazamio
+#   pip install spotapi
 #
 # Binaries downloaded at runtime to %TEMP%\YTDL_bin:
-# yt-dlp.exe, ffmpeg.exe, ffprobe.exe, deno.exe
+#   yt-dlp.exe, ffmpeg.exe, ffprobe.exe, deno.exe
 
 from __future__ import annotations
 
 import asyncio
 import ctypes
+import html
+import json
 import os
 import re
 import shutil
@@ -25,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse, urlunparse, urlencode
+import threading
 
 import requests
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -109,11 +113,22 @@ QProgressBar {
   background: #101522; height: 14px;
 }
 QProgressBar::chunk { background: #3B82F6; border-radius: 10px; }
+QComboBox {
+  background: #0F1320; border: 1px solid #2A3042; border-radius: 10px;
+  padding: 8px 10px;
+}
+QComboBox QAbstractItemView {
+  background: #0F1320; border: 1px solid #2A3042; selection-background-color: #3B82F6;
+}
+QPushButton {
+  background: #1A2031; border: 1px solid #2A3042; border-radius: 10px;
+  padding: 10px 12px;
+}
+QPushButton:hover { background: #20283D; }
 """
 
 
 # Helpers: filename sanitization
-_INVALID_FS_CHARS = r'<>:"/\\|?*'
 _INVALID_FS_RE = re.compile(r'[<>:"/\\|?*]+')
 
 
@@ -123,7 +138,6 @@ def sanitize_filename(name: str, max_len: int = 180) -> str:
     s = re.sub(r"\s+", " ", s).strip().strip(". ")
     if not s:
         s = "audio"
-    # Windows path component length safety
     if len(s) > max_len:
         s = s[:max_len].rstrip()
     return s
@@ -175,7 +189,6 @@ def _strip_trailing_marketing(title: str) -> str:
     if not s:
         return s
 
-    # Remove trailing (...) or [...] if it looks like marketing
     while s.endswith((")", "]")):
         close_idx = len(s) - 1
         open_ch = "(" if s.endswith(")") else "["
@@ -258,10 +271,17 @@ def _tail(text: str, max_chars: int = 4000) -> str:
 
 
 def run_cmd(args: List[str], cwd: Optional[Path] = None, timeout: Optional[int] = None) -> Tuple[str, str]:
+    """
+    Strongest practical Windows "no console flash" subprocess config:
+      - CREATE_NO_WINDOW
+      - STARTUPINFO w/ SW_HIDE
+    """
     import subprocess
 
-    # Strong hide on Windows: CREATE_NO_WINDOW + STARTUPINFO(SW_HIDE)
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    creationflags = 0
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        creationflags |= subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+
     si = subprocess.STARTUPINFO()
     si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
     si.wShowWindow = 0  # SW_HIDE
@@ -277,6 +297,7 @@ def run_cmd(args: List[str], cwd: Optional[Path] = None, timeout: Optional[int] 
             shell=False,
             startupinfo=si,
             creationflags=creationflags,
+            stdin=subprocess.DEVNULL,
         )
     except Exception as e:
         raise AppError(f"Failed to start process:\n{args[0]}\n\n{e}") from e
@@ -429,7 +450,6 @@ class TrackMeta:
     artwork_url: str = ""
     artwork_jpeg: bytes = b""
     comment: str = ""  # Source URL
-    # Optional extra (debug / provenance)
     source: str = ""
 
 
@@ -544,7 +564,11 @@ def pick_best_itunes_result(results: List[Dict[str, Any]], want_artist: str, wan
     for item in results:
         a = _norm(item.get("artistName", ""))
         t = _norm(item.get("trackName", ""))
+
+        # Hard-ish guard: if title similarity is extremely low, de-prioritize strongly
+        title_sim = token_jaccard(want_title, item.get("trackName", "") or "")
         score = 0
+
         if wt and wt in t:
             score += 6
         if wa and wa in a:
@@ -557,6 +581,13 @@ def pick_best_itunes_result(results: List[Dict[str, Any]], want_artist: str, wan
             score += 1
         if "karaoke" in t:
             score -= 2
+
+        # Penalize big mismatch with the YouTube title
+        if title_sim < 0.20 and wt:
+            score -= 8
+        elif title_sim < 0.35 and wt:
+            score -= 3
+
         if score > best_score:
             best_score = score
             best = item
@@ -567,7 +598,7 @@ def pick_best_itunes_result(results: List[Dict[str, Any]], want_artist: str, wan
 def upgrade_artwork_url(artwork_url: str) -> str:
     if not artwork_url:
         return ""
-    return re.sub(r"/\d+x\d+bb\.(jpg|png)$", "/1000x1000bb.jpg", artwork_url, flags=re.IGNORECASE)
+    return re.sub(r"/\d+x\d+bb\.(jpg|png)$", "/1200x1200bb.jpg", artwork_url, flags=re.IGNORECASE)
 
 
 def download_artwork(cs: CooldownSession, url: str) -> bytes:
@@ -603,14 +634,12 @@ def meta_from_itunes_item(item: Dict[str, Any]) -> TrackMeta:
 
     art = item.get("artworkUrl100") or item.get("artworkUrl60") or ""
     m.artwork_url = upgrade_artwork_url(art) if art else ""
+    m.source = "iTunes"
     return m
 
 
 # JioSaavn API (unofficial, via saavnapi-nine)
 def jiosaavn_search(cs: CooldownSession, query: str) -> Optional[TrackMeta]:
-    """
-    Best-effort: use saavnapi-nine.vercel.app 'result' endpoint to search by query string.
-    """
     q = (query or "").strip()
     if not q:
         return None
@@ -623,11 +652,8 @@ def jiosaavn_search(cs: CooldownSession, query: str) -> Optional[TrackMeta]:
     except Exception:
         return None
 
-    # The API returns a structure that can vary by deployment; handle loosely.
-    # Prefer first item that looks like a song.
     items = None
     if isinstance(data, dict):
-        # common patterns: {"data": [...]}, {"results": [...]}, {"songs": {"data":[...]}}
         if isinstance(data.get("data"), list):
             items = data["data"]
         elif isinstance(data.get("results"), list):
@@ -667,11 +693,6 @@ def jiosaavn_search(cs: CooldownSession, query: str) -> Optional[TrackMeta]:
 
 # Spotify SpotAPI integration (best-effort)
 def spotapi_quick_search(artist: str, title: str) -> Optional[TrackMeta]:
-    """
-    Best-effort SpotAPI integration.
-    SpotAPI upstream focuses on public+private Spotify APIs, and some usages require auth/cookies/solver.
-    This function tries safe import + a few likely public search calls; if not possible, returns None.
-    """
     q_artist = (artist or "").strip()
     q_title = (title or "").strip()
     term = " ".join([x for x in [q_artist, q_title] if x]).strip()
@@ -683,18 +704,14 @@ def spotapi_quick_search(artist: str, title: str) -> Optional[TrackMeta]:
     except Exception:
         return None
 
-    # We don't know exact public search surface in the user's installed version.
-    # Try multiple patterns defensively.
     candidates: List[dict] = []
 
-    # Pattern A: spotapi.Public / PublicSearch / PublicClient etc.
     for attr in ("Public", "PublicClient", "PublicSearch", "Search", "Song", "PublicSong"):
         try:
             cls = getattr(spotapi, attr, None)
             if cls is None:
                 continue
-            obj = cls()  # some accept no args for public calls
-            # Try common method names
+            obj = cls()  # type: ignore
             for meth in ("search", "search_song", "search_track", "query"):
                 fn = getattr(obj, meth, None)
                 if callable(fn):
@@ -709,7 +726,6 @@ def spotapi_quick_search(artist: str, title: str) -> Optional[TrackMeta]:
         except Exception:
             pass
 
-    # Pattern B: look under spotapi.public module
     try:
         from spotapi import public as spot_public  # type: ignore
 
@@ -734,18 +750,15 @@ def spotapi_quick_search(artist: str, title: str) -> Optional[TrackMeta]:
     except Exception:
         pass
 
-    # Parse a likely track from whatever we got
     def dig_tracks(x: Any) -> List[dict]:
         out: List[dict] = []
         if isinstance(x, dict):
-            # Spotify-like shapes
             for k in ("tracks", "items", "data", "results"):
                 v = x.get(k)
                 if isinstance(v, list):
                     out.extend([i for i in v if isinstance(i, dict)])
                 if isinstance(v, dict):
                     out.extend(dig_tracks(v))
-            # Search endpoint often returns {"tracks":{"items":[...]}}
             for v in x.values():
                 out.extend(dig_tracks(v))
         elif isinstance(x, list):
@@ -757,7 +770,6 @@ def spotapi_quick_search(artist: str, title: str) -> Optional[TrackMeta]:
     for c in candidates:
         tracks.extend(dig_tracks(c))
 
-    # Pick something plausible
     def score(t: dict) -> int:
         name = _norm(t.get("name") or t.get("title") or "")
         arts = ""
@@ -766,6 +778,7 @@ def spotapi_quick_search(artist: str, title: str) -> Optional[TrackMeta]:
             arts = _norm(a[0].get("name") or "")
         elif isinstance(a, str):
             arts = _norm(a)
+
         want_t = _norm(q_title)
         want_a = _norm(q_artist)
         s = 0
@@ -777,6 +790,14 @@ def spotapi_quick_search(artist: str, title: str) -> Optional[TrackMeta]:
             s += 3
         if want_a and arts == want_a:
             s += 3
+
+        # Penalize huge title mismatch vs expected
+        if want_t:
+            ts = token_jaccard(q_title, t.get("name") or t.get("title") or "")
+            if ts < 0.20:
+                s -= 8
+            elif ts < 0.35:
+                s -= 3
         return s
 
     if not tracks:
@@ -788,7 +809,6 @@ def spotapi_quick_search(artist: str, title: str) -> Optional[TrackMeta]:
     m = TrackMeta()
     m.title = (top.get("name") or top.get("title") or "").strip()
 
-    # artists
     a = top.get("artists")
     if isinstance(a, list) and a:
         names = []
@@ -799,13 +819,11 @@ def spotapi_quick_search(artist: str, title: str) -> Optional[TrackMeta]:
     elif isinstance(a, str):
         m.artist = a.strip()
 
-    # album
     alb = top.get("album")
     if isinstance(alb, dict):
         m.album = (alb.get("name") or "").strip()
         imgs = alb.get("images")
         if isinstance(imgs, list) and imgs:
-            # pick highest-ish
             url = ""
             for im in imgs:
                 if isinstance(im, dict) and im.get("url"):
@@ -815,7 +833,6 @@ def spotapi_quick_search(artist: str, title: str) -> Optional[TrackMeta]:
     else:
         m.album = (top.get("album") or "").strip()
 
-    # year
     rel = ""
     if isinstance(alb, dict):
         rel = alb.get("release_date") or ""
@@ -849,7 +866,7 @@ def ffprobe_duration_seconds(path: Path) -> float:
         return 0.0
 
 
-def wav_slice_normalized(src_wav: Path, dst_wav: Path, start_s: float, dur_s: float = 30.0) -> None:
+def wav_slice_normalized(src_wav: Path, dst_wav: Path, start_s: float, dur_s: float = 10.0) -> None:
     run_cmd(
         [
             str(FFMPEG_PATH),
@@ -922,11 +939,16 @@ def shazam_recognize_wav(wav_path: Path) -> Dict[str, Any]:
     except Exception as e:
         raise AppError("Advanced Metadata requires 'shazamio'.\n\nInstall it with:\n  pip install shazamio") from e
 
+    async def _do() -> Dict[str, Any]:
+        shazam = Shazam()
+        if hasattr(shazam, "recognize") and callable(getattr(shazam, "recognize")):
+            return await shazam.recognize(str(wav_path))  # type: ignore[attr-defined]
+        return await shazam.recognize_song(str(wav_path))  # type: ignore[attr-defined]
+
     loop = asyncio.new_event_loop()
     try:
         asyncio.set_event_loop(loop)
-        shazam = Shazam()
-        return loop.run_until_complete(shazam.recognize_song(str(wav_path)))
+        return loop.run_until_complete(_do())
     finally:
         try:
             loop.close()
@@ -973,20 +995,22 @@ def extract_shazam_fields(payload: Dict[str, Any]) -> Tuple[str, str, str]:
 
 def shazam_best_guess_from_wav(src_wav: Path, work_dir: Path, progress_cb) -> TrackMeta:
     duration = ffprobe_duration_seconds(src_wav)
-    if duration <= 10:
+    if duration <= 12:
         raise AppError("Audio is too short to recognize reliably.")
 
-    offsets: List[float] = []
-    base = 30.0
-    if duration > base + 31:
-        offsets.append(base)
-    for frac in (0.25, 0.45, 0.65, 0.80):
-        t = min(max(0.0, duration * frac), max(0.0, duration - 31.0))
-        if not offsets or all(abs(t - o) > 10 for o in offsets):
-            offsets.append(t)
-    offsets = offsets[:5]
+    slice_dur = 10.0
+    max_start = max(0.0, duration - slice_dur - 0.5)
 
-    # vote-based
+    candidates = [max(0.0, min(max_start, 8.0))]
+    candidates.append(max(0.0, min(max_start, duration * 0.40)))
+    candidates.append(max(0.0, min(max_start, duration * 0.70)))
+
+    offsets: List[float] = []
+    for t in candidates:
+        if not offsets or all(abs(t - o) > 5.0 for o in offsets):
+            offsets.append(t)
+    offsets = offsets[:3]
+
     votes: Dict[str, int] = {}
     tracks: Dict[str, Dict[str, Any]] = {}
 
@@ -1000,7 +1024,7 @@ def shazam_best_guess_from_wav(src_wav: Path, work_dir: Path, progress_cb) -> Tr
     for i, start_s in enumerate(offsets, 1):
         progress_cb(f"Shazam: slice {i}/{len(offsets)}…")
         slice_wav = work_dir / f"slice_{i}.wav"
-        wav_slice_normalized(src_wav, slice_wav, start_s, 30.0)
+        wav_slice_normalized(src_wav, slice_wav, start_s, slice_dur)
         try:
             payload = shazam_recognize_wav(slice_wav)
         finally:
@@ -1021,7 +1045,6 @@ def shazam_best_guess_from_wav(src_wav: Path, work_dir: Path, progress_cb) -> Tr
     if not votes:
         return TrackMeta()
 
-    # pick highest votes, tie-break ISRC
     items = list(votes.items())
     items.sort(key=lambda kv: (kv[1], has_isrc(tracks[kv[0]])), reverse=True)
     best_key = items[0][0]
@@ -1108,7 +1131,6 @@ def write_id3_tags_v23(mp3_path: Path, meta: TrackMeta) -> None:
         tags.delall("COMM")
         tags.add(COMM(encoding=ENC, lang="eng", desc="Source", text=meta.comment))
 
-    # Extra compatibility frames
     set_txxx("ARTISTS", meta.artist or "")
     set_txxx("ALBUMARTIST", meta.album_artist or "")
     if meta.isrc:
@@ -1155,33 +1177,90 @@ def merge_meta(base: TrackMeta, incoming: TrackMeta, prefer_incoming: bool = Tru
             if b and not a:
                 setattr(out, field, b)
             elif b and a and field in ("album", "year", "genre", "itunes_track_id", "artwork_url"):
-                # For these fields, incoming typically higher confidence
                 setattr(out, field, b)
         else:
             if not a and b:
                 setattr(out, field, b)
 
-    # artwork bytes
     if incoming.artwork_jpeg and not out.artwork_jpeg:
         out.artwork_jpeg = incoming.artwork_jpeg
 
-    if not out.album:
-        out.album = clean_album_name(out.album)
+    out.album = clean_album_name(out.album)
     if not out.album_artist:
         out.album_artist = out.artist or ""
     return out
 
 
+# -------- Review / mismatch detection --------
+def token_jaccard(a: str, b: str) -> float:
+    ta = set(_norm(a).split())
+    tb = set(_norm(b).split())
+    if not ta and not tb:
+        return 1.0
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / max(1, len(ta | tb))
+
+
+def needs_review(yt_artist: str, yt_title: str, meta_artist: str, meta_title: str) -> bool:
+    if not (yt_title or yt_artist):
+        return False
+
+    title_sim = token_jaccard(yt_title, meta_title)
+    artist_sim = token_jaccard(yt_artist, meta_artist) if yt_artist and meta_artist else 1.0
+
+    if title_sim < 0.45:
+        return True
+    if title_sim < 0.60 and artist_sim < 0.55:
+        return True
+    return False
+
+
+def format_meta_line(m: TrackMeta) -> str:
+    a = (m.artist or "").strip()
+    t = (m.title or "").strip()
+    alb = (m.album or "").strip()
+    src = (m.source or "").strip()
+    base = f"{a} — {t}".strip(" —")
+    if alb:
+        base += f"  |  {alb}"
+    if src:
+        base += f"  ({src})"
+    return base or "Unknown"
+
+
+def itunes_candidates(cs: CooldownSession, artist: str, title: str, limit: int = 6) -> List[TrackMeta]:
+    out: List[TrackMeta] = []
+    terms = itunes_search_variants(artist, title)
+    for term in terms[:2]:
+        try:
+            data = itunes_search(cs, term, limit=limit)
+            res = data.get("results") or []
+            for item in res:
+                if isinstance(item, dict) and item.get("trackName") and item.get("artistName"):
+                    tm = meta_from_itunes_item(item)
+                    # Light guard: keep candidates that resemble the YT title at least a bit
+                    if title and token_jaccard(title, tm.title) < 0.18:
+                        continue
+                    out.append(tm)
+        except Exception:
+            continue
+        if len(out) >= limit:
+            break
+    seen = set()
+    ded: List[TrackMeta] = []
+    for m in out:
+        k = f"{_norm(m.artist)}|{_norm(m.title)}"
+        if k in seen:
+            continue
+        seen.add(k)
+        ded.append(m)
+    return ded[:limit]
+
+
 # Metadata pipelines
 def quick_itunes_enrich(cs: CooldownSession, base: TrackMeta) -> TrackMeta:
-    """
-    Basic mode iTunes: minimal requests for speed.
-    - If ISRC exists: itunes search isrc:...
-    - else: first variant only
-    - then optional lookup for richer fields if we got trackId
-    """
     meta = TrackMeta(**base.__dict__)
-
     chosen: Optional[Dict[str, Any]] = None
 
     if meta.isrc:
@@ -1236,16 +1315,14 @@ def advanced_enrich(
     wav_path: Path,
     work_dir: Path,
     progress_cb,
-) -> TrackMeta:
+) -> Tuple[TrackMeta, Optional[TrackMeta]]:
     """
-    Advanced pipeline order:
-      parse youtube title -> song.link -> Shazam Recognition -> iTunes Search -> song.link -> SpotAPI -> iTunes Lookup
+    Returns (final_meta, shazam_meta_if_any)
     """
     meta = TrackMeta(**base_from_title.__dict__)
+    shz_meta: Optional[TrackMeta] = None
 
-    # 1) song.link
     progress_cb("song.link: resolving…")
-    it_id = ""
     try:
         payload = songlink_lookup(cs, youtube_url)
         it_id = songlink_extract_itunes_id(payload)
@@ -1254,14 +1331,13 @@ def advanced_enrich(
     except Exception:
         pass
 
-    # 2) Shazam
     progress_cb("Shazam: matching…")
     shz = shazam_best_guess_from_wav(wav_path, work_dir, progress_cb)
     if shz.title or shz.artist or shz.isrc:
         shz.comment = meta.comment
         meta = merge_meta(meta, shz, prefer_incoming=True)
+        shz_meta = shz
 
-    # 3) iTunes search (more aggressive)
     progress_cb("iTunes: searching…")
     chosen: Optional[Dict[str, Any]] = None
     if meta.isrc:
@@ -1295,7 +1371,6 @@ def advanced_enrich(
             except Exception:
                 meta.artwork_jpeg = b""
 
-    # 4) song.link again (per spec; can fill itunes ID after metadata changed)
     progress_cb("song.link: confirming…")
     try:
         payload = songlink_lookup(cs, youtube_url)
@@ -1305,14 +1380,12 @@ def advanced_enrich(
     except Exception:
         pass
 
-    # 5) SpotAPI
     progress_cb("Spotify (SpotAPI): searching…")
     sp = spotapi_quick_search(meta.artist, meta.title)
     if sp:
         sp.comment = meta.comment
-        meta = merge_meta(meta, sp, prefer_incoming=False)  # don't override strong iTunes fields
+        meta = merge_meta(meta, sp, prefer_incoming=False)
 
-    # 6) iTunes lookup (final)
     progress_cb("iTunes: lookup…")
     if meta.itunes_track_id:
         try:
@@ -1323,7 +1396,6 @@ def advanced_enrich(
         except Exception:
             pass
 
-    # Bonus: JioSaavn (new integration) - best-effort extra artwork/album/year if missing
     progress_cb("JioSaavn: searching…")
     js = jiosaavn_search(cs, f"{meta.artist} {meta.title}".strip())
     if js:
@@ -1333,7 +1405,7 @@ def advanced_enrich(
     meta.album = clean_album_name(meta.album)
     if not meta.album_artist:
         meta.album_artist = meta.artist or ""
-    return meta
+    return meta, shz_meta
 
 
 # Copy/save helpers
@@ -1355,14 +1427,15 @@ def unique_path(dest_dir: Path, base_name: str) -> Path:
         i += 1
 
 
-def build_display_filename(meta: TrackMeta) -> str:
-    # Required format: Artist - Title (cover/remix etc)
-    # We preserve parentheses from the parsed/enriched title; just sanitize later.
+def build_display_filename(meta: TrackMeta, track_prefix: str = "") -> str:
     a = (meta.artist or "").strip()
     t = (meta.title or "").strip()
-    if a and t:
-        return f"{a} - {t}"
-    return t or a or "audio"
+    core = f"{a} - {t}".strip(" -")
+    if not core:
+        core = t or a or "audio"
+    if track_prefix:
+        return f"{track_prefix} {core}".strip()
+    return core
 
 
 # URL helpers: playlist detection + normalization
@@ -1393,7 +1466,6 @@ def classify_youtube_url(url: str) -> UrlIntent:
 
 
 def strip_playlist_from_watch_url(url: str) -> str:
-    # Remove list param and related playlist indices
     p = urlparse(url)
     qs = parse_qs(p.query or "")
     for k in ("list", "index", "start_radio", "radio", "pp"):
@@ -1403,12 +1475,30 @@ def strip_playlist_from_watch_url(url: str) -> str:
     return urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, p.fragment))
 
 
+def extract_youtube_id(url: str) -> str:
+    u = (url or "").strip()
+    try:
+        p = urlparse(u)
+    except Exception:
+        return ""
+    host = (p.netloc or "").lower()
+    if "youtu.be" in host:
+        vid = (p.path or "").strip("/").split("/")[0]
+        return vid
+    qs = parse_qs(p.query or "")
+    v = qs.get("v", [""])[0]
+    if v:
+        return v
+    if (p.path or "").lower().startswith("/shorts/"):
+        return (p.path or "").split("/shorts/")[-1].split("/")[0]
+    return ""
+
+
 # Connectivity check (hard requirement)
 def check_internet_required() -> None:
     try:
         r = requests.get(CONNECT_TEST_URL, timeout=6, headers={"User-Agent": USER_AGENT})
         r.raise_for_status()
-        # "resolves successfully" requirement: we treat HTTP 200 as success.
         return
     except Exception as e:
         raise AppError(
@@ -1418,19 +1508,6 @@ def check_internet_required() -> None:
         )
 
 
-# Progress plan
-@dataclass
-class ProgressPlan:
-    tools: int = 5
-    title: int = 14
-    download: int = 48
-    to_wav: int = 62
-    meta: int = 84
-    to_mp3: int = 94
-    save: int = 98
-    done: int = 100
-
-
 # Worker: download + tag
 class PipelineWorker(QtCore.QObject):
     progress_text = QtCore.Signal(str)
@@ -1438,18 +1515,107 @@ class PipelineWorker(QtCore.QObject):
     error = QtCore.Signal(str)
     finished = QtCore.Signal(list)  # list of saved output paths (strings)
 
+    # Metadata review request to UI thread
+    review_needed = QtCore.Signal(dict)  # payload includes request_id + fields
+
     def __init__(self, url: str, advanced: bool, playlist_mode: str):
         super().__init__()
         self.url = url
         self.advanced = bool(advanced)
         self.playlist_mode = playlist_mode  # "single" or "playlist"
         self.cs = CooldownSession(USER_AGENT, cooldown_s=REQUEST_COOLDOWN_S)
-        self.plan = ProgressPlan()
         self.run_root = Path(tempfile.mkdtemp(prefix=f"{APP_NAME}_run_"))
+
+        # Review coordination
+        self._review_lock = threading.Lock()
+        self._review_event: Optional[threading.Event] = None
+        self._review_selected_index: int = 0
+        self._review_request_id: str = ""
 
     def _set(self, pct: int, text: str):
         self.progress_value.emit(int(max(0, min(100, pct))))
         self.progress_text.emit(text)
+
+    def _set_playlist_progress(self, total: int, idx: int, stage_pct: int, msg: str):
+        per = 100.0 / max(1, total)
+        overall = int((idx - 1) * per + (stage_pct / 100.0) * per)
+        overall = max(0, min(100, overall))
+        self._set(overall, f"Track {idx}/{total}: {msg}")
+
+    @QtCore.Slot(str, str, object)
+    def receive_review_result(self, request_id: str, chosen_key: str, _unused: object = None):
+        with self._review_lock:
+            if not self._review_event or request_id != self._review_request_id:
+                return
+            try:
+                self._review_selected_index = int(chosen_key)
+            except Exception:
+                self._review_selected_index = 0
+            self._review_event.set()
+
+    def _request_review_blocking(
+        self,
+        yt_raw: str,
+        yt_artist: str,
+        yt_title: str,
+        candidates: List[TrackMeta],
+        current: TrackMeta,
+    ) -> TrackMeta:
+        merged: List[TrackMeta] = []
+        merged.append(current)
+
+        yt_candidate = TrackMeta(
+            title=yt_title or (yt_raw or ""),
+            artist=yt_artist or "",
+            album_artist=yt_artist or "",
+            comment=current.comment,
+            source="YouTubeTitle",
+        )
+        merged.append(yt_candidate)
+
+        seen = set()
+        for m in merged:
+            seen.add(f"{_norm(m.artist)}|{_norm(m.title)}")
+        for m in candidates:
+            k = f"{_norm(m.artist)}|{_norm(m.title)}"
+            if k in seen:
+                continue
+            seen.add(k)
+            merged.append(m)
+
+        merged = merged[:10]
+
+        request_id = f"rev_{int(time.time()*1000)}_{os.getpid()}"
+        evt = threading.Event()
+        with self._review_lock:
+            self._review_request_id = request_id
+            self._review_event = evt
+            self._review_selected_index = 0
+
+        payload = {
+            "request_id": request_id,
+            "yt_raw": yt_raw or "",
+            "yt_parsed": f"{(yt_artist or '').strip()} — {(yt_title or '').strip()}".strip(" —"),
+            "candidates": [format_meta_line(m) for m in merged],
+        }
+        self.review_needed.emit(payload)
+
+        evt.wait()
+
+        with self._review_lock:
+            sel = max(0, min(len(merged) - 1, self._review_selected_index))
+            self._review_event = None
+            self._review_request_id = ""
+            chosen = merged[sel]
+
+        chosen.comment = current.comment
+        if not chosen.album_artist:
+            chosen.album_artist = chosen.artist or ""
+        if current.artwork_jpeg and not chosen.artwork_jpeg:
+            chosen.artwork_jpeg = current.artwork_jpeg
+        if current.artwork_url and not chosen.artwork_url:
+            chosen.artwork_url = current.artwork_url
+        return chosen
 
     @QtCore.Slot()
     def run(self):
@@ -1467,52 +1633,109 @@ class PipelineWorker(QtCore.QObject):
                 pass
 
     def _run_impl(self) -> List[Path]:
-        # Connectivity gate (required)
         self._set(2, "Checking internet…")
         check_internet_required()
 
-        self._set(self.plan.tools, "Preparing tools…")
+        self._set(6, "Preparing tools…")
         Toolchain(USER_AGENT).ensure_ready()
 
-        # Playlist expansion if needed
         if self.playlist_mode == "playlist":
-            self._set(8, "Reading playlist…")
+            self._set(10, "Reading playlist…")
             pl_title, entries = self._ytdlp_list_playlist(self.url)
-            folder = downloads_dir() / sanitize_filename(pl_title or "Playlist")
+
+            pl_title_line = sanitize_filename(pl_title or "") or "Playlist"
+            folder = downloads_dir() / pl_title_line
+            folder.mkdir(parents=True, exist_ok=True)
+
             saved: List[Path] = []
             total = max(1, len(entries))
+            folder_maybe_generic = (pl_title_line.strip().lower() == "playlist")
+
             for idx, vid_url in enumerate(entries, 1):
-                # Scale progress across playlist items (still deterministic-ish)
-                base = 10 + int((idx - 1) * 88 / total)
-                self._set(base, f"Playlist item {idx}/{total}…")
-                saved.append(self._process_single_video(vid_url, out_dir=folder, allow_playlist=False))
+                self._set_playlist_progress(total, idx, 0, "Starting…")
+                out_path, final_meta = self._process_single_video(
+                    vid_url,
+                    out_dir=folder,
+                    allow_playlist=False,
+                    playlist_index=idx,
+                    playlist_total=total,
+                    progress_mapper=lambda sp, msg, _idx=idx: self._set_playlist_progress(total, _idx, sp, msg),
+                )
+                saved.append(out_path)
+
+                if folder_maybe_generic and idx == 1:
+                    alb = sanitize_filename(final_meta.album or "")
+                    if alb and alb.lower() != "playlist":
+                        desired = downloads_dir() / alb
+                        if desired != folder:
+                            try:
+                                desired.mkdir(parents=True, exist_ok=True)
+                                for item in folder.iterdir():
+                                    shutil.move(str(item), str(desired / item.name))
+                                try:
+                                    folder.rmdir()
+                                except Exception:
+                                    pass
+                                folder = desired
+                            except Exception:
+                                pass
+                        folder_maybe_generic = False
+
             self._set(100, "Done.")
             return saved
 
-        # Single video
-        out = self._process_single_video(self.url, out_dir=downloads_dir(), allow_playlist=False)
-        self._set(self.plan.done, "Done.")
-        return [out]
+        out_path, _meta = self._process_single_video(
+            self.url,
+            out_dir=downloads_dir(),
+            allow_playlist=False,
+            playlist_index=0,
+            playlist_total=0,
+            progress_mapper=None,
+        )
+        self._set(100, "Done.")
+        return [out_path]
 
-    def _process_single_video(self, url: str, out_dir: Path, allow_playlist: bool) -> Path:
+    def _process_single_video(
+        self,
+        url: str,
+        out_dir: Path,
+        allow_playlist: bool,
+        playlist_index: int,
+        playlist_total: int,
+        progress_mapper,
+    ) -> Tuple[Path, TrackMeta]:
         work = self.run_root / f"job_{int(time.time()*1000)}"
         dl_dir = work / "dl"
         tmp_dir = work / "tmp"
         dl_dir.mkdir(parents=True, exist_ok=True)
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
-        self._set(self.plan.title, "Fetching title…")
-        yt_title = self._ytdlp_get_title(url, allow_playlist=allow_playlist)
+        def set_stage(stage_pct: int, msg: str):
+            if progress_mapper:
+                progress_mapper(stage_pct, msg)
+            else:
+                self._set(stage_pct, msg)
 
-        self._set(self.plan.download, "Downloading audio…")
-        downloaded = self._ytdlp_download_audio(url, dl_dir, allow_playlist=allow_playlist)
+        # ---- Stage: Title + channel (NEW: use channel name when title has no artist) ----
+        set_stage(8, "Fetching title…")
+        yt_title, yt_channel = self._ytdlp_get_title_and_uploader(url, allow_playlist=allow_playlist)
 
-        self._set(self.plan.to_wav, "Converting to WAV…")
+        set_stage(25, "Downloading audio…")
+        downloaded = self._download_audio_with_fallbacks(url, dl_dir, allow_playlist=allow_playlist)
+
+        set_stage(45, "Converting to WAV…")
         wav_path = tmp_dir / "audio.wav"
         to_wav_for_analysis(downloaded, wav_path)
 
-        # Base meta from YouTube title
         fa, ft = parse_youtube_title(yt_title)
+        fa = (fa or "").strip()
+        ft = (ft or "").strip()
+
+        # If title looks like just a song name (no "Artist - Title"), use channel/uploader as artist.
+        # This ensures metadata searches are aligned with the YouTube title context.
+        if not fa:
+            fa = (yt_channel or "").strip()
+
         base = TrackMeta(
             title=ft or yt_title or "",
             artist=fa or "",
@@ -1521,28 +1744,30 @@ class PipelineWorker(QtCore.QObject):
             source="YouTubeTitle",
         )
 
-        # Metadata pipeline selection
-        self._set(self.plan.meta, "Metadata: basic…")
+        if playlist_total > 0 and playlist_index > 0:
+            base.track_number = str(playlist_index)
+            base.track_total = str(playlist_total)
+
+        set_stage(60, "Metadata: resolving…")
         final_meta = TrackMeta(**base.__dict__)
+        shz_meta: Optional[TrackMeta] = None
 
         if not self.advanced:
-            # Basic: parse title -> quick iTunes lookup / Spotify -> save
             enriched = quick_itunes_enrich(self.cs, final_meta)
             final_meta = merge_meta(final_meta, enriched, prefer_incoming=True)
 
-            # Spotify quick add (SpotAPI) if it can help fill gaps
             sp = spotapi_quick_search(final_meta.artist, final_meta.title)
             if sp:
                 sp.comment = final_meta.comment
                 final_meta = merge_meta(final_meta, sp, prefer_incoming=False)
-
         else:
-            # Advanced: parse title -> song.link -> Shazam -> iTunes Search -> song.link -> SpotAPI -> iTunes Lookup
             def cb(msg: str):
-                # keep within the same stage, user sees granular steps
-                self.progress_text.emit(msg)
+                if playlist_total > 0 and playlist_index > 0:
+                    self.progress_text.emit(f"Track {playlist_index}/{playlist_total}: {msg}")
+                else:
+                    self.progress_text.emit(msg)
 
-            final_meta = advanced_enrich(
+            final_meta, shz_meta = advanced_enrich(
                 self.cs,
                 youtube_url=url,
                 base_from_title=final_meta,
@@ -1551,54 +1776,79 @@ class PipelineWorker(QtCore.QObject):
                 progress_cb=cb,
             )
 
-        # Ensure album cleaned
         final_meta.album = clean_album_name(final_meta.album)
         if not final_meta.album_artist:
             final_meta.album_artist = final_meta.artist or ""
 
-        # Build MP3
-        self._set(self.plan.to_mp3, "Encoding MP3…")
+        if playlist_total > 0 and playlist_index > 0:
+            final_meta.track_number = str(playlist_index)
+            final_meta.track_total = str(playlist_total)
+
+        # ---- NEW: Always presume metadata might be wrong; always offer Review Metadata UI ----
+        # We still compute mismatch to help stage text, but we ALWAYS let the user choose.
+        mismatch = needs_review(fa, ft or yt_title, final_meta.artist, final_meta.title)
+
+        set_stage(72, "Reviewing metadata…" if mismatch else "Confirming metadata…")
+
+        cands: List[TrackMeta] = []
+        if shz_meta and (shz_meta.title or shz_meta.artist):
+            cands.append(shz_meta)
+
+        # Candidate search should be keyed to what the user saw on YouTube
+        # (artist from parsed title, or uploader fallback) + parsed/clean title.
+        want_artist = fa or final_meta.artist
+        want_title = ft or final_meta.title
+        cands.extend(itunes_candidates(self.cs, want_artist, want_title, limit=6))
+
+        chosen = self._request_review_blocking(
+            yt_raw=yt_title,
+            yt_artist=fa,
+            yt_title=ft or yt_title,
+            candidates=cands,
+            current=final_meta,
+        )
+        if chosen.artwork_url and not chosen.artwork_jpeg:
+            try:
+                chosen.artwork_jpeg = download_artwork(self.cs, chosen.artwork_url)
+            except Exception:
+                chosen.artwork_jpeg = b""
+        final_meta = merge_meta(final_meta, chosen, prefer_incoming=True)
+
+        if playlist_total > 0 and playlist_index > 0:
+            final_meta.track_number = str(playlist_index)
+            final_meta.track_total = str(playlist_total)
+
+        set_stage(82, "Encoding MP3…")
         mp3_tmp = tmp_dir / "final.mp3"
         wav_to_mp3_high_compat(wav_path, mp3_tmp)
 
-        # Build filename + save
-        self._set(self.plan.save, "Saving…")
-        base_name = build_display_filename(final_meta)
+        set_stage(92, "Saving…")
+
+        track_prefix = ""
+        if playlist_total > 0 and playlist_index > 0:
+            width = max(2, len(str(playlist_total)))
+            track_prefix = str(playlist_index).zfill(width)
+
+        base_name = build_display_filename(final_meta, track_prefix=track_prefix)
         dest_path = unique_path(out_dir, base_name)
 
         shutil.copy2(mp3_tmp, dest_path)
         write_id3_tags_v23(dest_path, final_meta)
-        return dest_path
+
+        set_stage(100, "Done.")
+        return dest_path, final_meta
 
     # ----- yt-dlp helpers -----
-    def _ytdlp_get_title(self, url: str, allow_playlist: bool) -> str:
-        args = [
-            str(YTDLP_PATH),
-            "--skip-download",
-            "--print",
-            "%(title)s",
-            "--no-warnings",
-        ]
-        if not allow_playlist:
-            args.append("--no-playlist")
-        args.append(url)
-        out, _ = run_cmd(args, cwd=self.run_root)
-        return (out or "").strip()
 
-    def _ytdlp_download_audio(self, url: str, dl_dir: Path, allow_playlist: bool) -> Path:
-        tmpl = str(dl_dir / "%(id)s.%(ext)s")
-        args = [
+    def _ytdlp_common_base_args(self) -> List[str]:
+        # Conservative “more likely to work” defaults; kept small to avoid breaking normal cases.
+        return [
             str(YTDLP_PATH),
-            url,
-            "-f",
-            "bestaudio/best",
             "--no-warnings",
             "--retries",
             "10",
             "--fragment-retries",
             "10",
-            "--concurrent-fragments",
-            "8",
             "--extractor-retries",
             "5",
             "--socket-timeout",
@@ -1606,15 +1856,87 @@ class PipelineWorker(QtCore.QObject):
             "--http-chunk-size",
             "10M",
             "--newline",
+        ]
+
+    def _ytdlp_get_title_and_uploader(self, url: str, allow_playlist: bool) -> Tuple[str, str]:
+        """
+        NEW: fetch both title and uploader/channel name.
+        Also includes multiple fallbacks when yt-dlp fails (client variants, no js-runtime).
+        """
+        # Try a few approaches in order
+        tries: List[List[str]] = []
+
+        def add_try(extra: Optional[List[str]] = None, use_js: bool = True):
+            args = [
+                str(YTDLP_PATH),
+                "--skip-download",
+                "--print",
+                "%(title)s",
+                "--print",
+                "%(uploader)s",
+                "--no-warnings",
+            ]
+            if not allow_playlist:
+                args.append("--no-playlist")
+            if use_js and DENO_PATH.exists():
+                args.extend(["--js-runtime", str(DENO_PATH)])
+            if extra:
+                args.extend(extra)
+            args.append(url)
+            tries.append(args)
+
+        # Normal
+        add_try(extra=None, use_js=True)
+
+        # No js-runtime (some environments fail with deno/js)
+        add_try(extra=None, use_js=False)
+
+        # Player client fallbacks
+        for c in ("android", "ios", "tv", "web,android"):
+            add_try(extra=["--extractor-args", f"youtube:player_client={c}"], use_js=True)
+            add_try(extra=["--extractor-args", f"youtube:player_client={c}"], use_js=False)
+
+        last_err = None
+        for args in tries:
+            try:
+                out, _ = run_cmd(args, cwd=self.run_root, timeout=90)
+                lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+                title = lines[0] if len(lines) >= 1 else (out or "").strip()
+                uploader = lines[1].replace(" - Topic", "") if len(lines) >= 2 else ""
+                return title, uploader
+            except Exception as e:
+                last_err = e
+                continue
+
+        raise AppError(f"Failed to fetch YouTube title/channel.\n\n{last_err}")
+
+    def _ytdlp_download_audio(
+        self,
+        url: str,
+        dl_dir: Path,
+        allow_playlist: bool,
+        extra_args: Optional[List[str]] = None,
+        use_js_runtime: bool = True,
+    ) -> Path:
+        tmpl = str(dl_dir / "%(id)s.%(ext)s")
+        args = self._ytdlp_common_base_args() + [
+            url,
+            "-f",
+            "bestaudio/best",
             "-o",
             tmpl,
-            "--js-runtime",
-            str(DENO_PATH),
         ]
         if not allow_playlist:
             args.append("--no-playlist")
 
-        run_cmd(args, cwd=self.run_root)
+        # Prefer deno runtime when available, but allow disabling as a fallback.
+        if use_js_runtime and DENO_PATH.exists():
+            args.extend(["--js-runtime", str(DENO_PATH)])
+
+        if extra_args:
+            args.extend(extra_args)
+
+        run_cmd(args, cwd=self.run_root, timeout=300)
 
         files = list(dl_dir.glob("*.*"))
         if not files:
@@ -1622,71 +1944,313 @@ class PipelineWorker(QtCore.QObject):
         files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         return files[0]
 
+    def _looks_like_ytdlp_botwall_or_403(self, msg: str) -> bool:
+        m = (msg or "").lower()
+        return (
+            ("not a bot" in m)
+            or ("sign in to confirm" in m)
+            or ("http error 403" in m)
+            or ("status code: 403" in m)
+            or ("forbidden" in m)
+            or ("too many requests" in m)
+            or ("http error 429" in m)
+            or ("status code: 429" in m)
+        )
+
+    def _download_audio_with_fallbacks(self, url: str, dl_dir: Path, allow_playlist: bool) -> Path:
+        """
+        Improved fallbacks:
+          1) Normal yt-dlp (with js-runtime)
+          2) yt-dlp without js-runtime (deno issues)
+          3) yt-dlp with alternate player clients (with/without js-runtime)
+          4) “network-ish” robustness toggles (ipv4, geo-bypass, no-check-certificate) + clients
+          5) API fallbacks (Piped, Invidious) for bot-wall/403 scenarios
+        """
+        # Helpers: clear partials between tries
+        def clear_dir():
+            for f in dl_dir.glob("*"):
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+
+        # 1) Normal
+        try:
+            return self._ytdlp_download_audio(url, dl_dir, allow_playlist=allow_playlist, use_js_runtime=True)
+        except AppError as e:
+            first_msg = str(e)
+        except Exception as e:
+            first_msg = str(e)
+
+        # 2) No js-runtime (deno/js failures, env oddities)
+        try:
+            clear_dir()
+            return self._ytdlp_download_audio(url, dl_dir, allow_playlist=allow_playlist, use_js_runtime=False)
+        except AppError:
+            pass
+
+        # 3) Player client fallbacks (with and without js-runtime)
+        client_variants = [
+            ["--extractor-args", "youtube:player_client=android"],
+            ["--extractor-args", "youtube:player_client=ios"],
+            ["--extractor-args", "youtube:player_client=tv"],
+            ["--extractor-args", "youtube:player_client=web,android"],
+        ]
+        for extra in client_variants:
+            for use_js in (True, False):
+                try:
+                    clear_dir()
+                    return self._ytdlp_download_audio(
+                        url, dl_dir, allow_playlist=allow_playlist, extra_args=extra, use_js_runtime=use_js
+                    )
+                except AppError:
+                    continue
+
+        # 4) Network-ish toggles (sometimes helps intermittent TLS/DNS/route problems)
+        net_toggles = ["--force-ipv4", "--geo-bypass", "--no-check-certificate"]
+        for extra in client_variants + [None]:
+            for use_js in (True, False):
+                try:
+                    clear_dir()
+                    eargs = []
+                    eargs.extend(net_toggles)
+                    if extra:
+                        eargs.extend(extra)
+                    return self._ytdlp_download_audio(
+                        url, dl_dir, allow_playlist=allow_playlist, extra_args=eargs, use_js_runtime=use_js
+                    )
+                except AppError:
+                    continue
+
+        # 5) API fallbacks for botwall/403-like errors (best-effort)
+        if self._looks_like_ytdlp_botwall_or_403(first_msg):
+            vid = extract_youtube_id(url)
+            if not vid:
+                raise AppError(
+                    "Download failed (YouTube rate-limits)"
+                )
+
+            try:
+                p = self._piped_pick_audio_url(vid)
+                if p:
+                    return self._download_direct_stream(p, dl_dir, vid, suffix=".m4a")
+            except Exception:
+                pass
+
+            try:
+                inv = self._invidious_pick_audio_url(vid)
+                if inv:
+                    return self._download_direct_stream(inv, dl_dir, vid, suffix=".m4a")
+            except Exception:
+                pass
+
+        # If nothing worked, show a stronger, more actionable message while keeping your UI unchanged.
+        raise AppError(
+            "Download failed after multiple fallbacks.\n\n"
+            "Common causes:\n"
+            "  • Temporary YouTube rate-limits / bot checks (403/429)\n"
+            "  • Network/TLS interception (VPN, corporate proxy)\n"
+            "  • YouTube-side changes\n\n"
+            "What you can try:\n"
+            "  • Try again later (sorry)"
+        )
+
+    def _download_direct_stream(self, stream_url: str, dl_dir: Path, vid: str, suffix: str = ".m4a") -> Path:
+        dl_dir.mkdir(parents=True, exist_ok=True)
+        out = dl_dir / f"{sanitize_filename(vid)}{suffix}"
+        tmp = out.with_suffix(out.suffix + ".part")
+        headers = {"User-Agent": USER_AGENT, "Referer": "https://www.youtube.com/"}
+        with requests.get(stream_url, stream=True, timeout=60, headers=headers) as r:
+            r.raise_for_status()
+            with open(tmp, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 256):
+                    if chunk:
+                        f.write(chunk)
+        tmp.replace(out)
+        return out
+
+    def _piped_pick_audio_url(self, vid: str) -> str:
+        api = f"https://piped.video/api/v1/streams/{vid}"
+        r = requests.get(api, timeout=15, headers={"User-Agent": USER_AGENT})
+        r.raise_for_status()
+        data = r.json()
+        streams = data.get("audioStreams") or data.get("adaptiveFormats") or []
+        best_url = ""
+        best_score = -1
+        for s in streams:
+            if not isinstance(s, dict):
+                continue
+            u = s.get("url") or ""
+            mime = (s.get("mimeType") or s.get("mime") or "").lower()
+            u = (u or "").strip()
+            if not u:
+                continue
+            if "audio" not in mime and not any(x in u for x in ("mime=audio", "audio")):
+                continue
+            br = s.get("bitrate") or s.get("averageBitrate") or 0
+            try:
+                br_i = int(br)
+            except Exception:
+                br_i = 0
+            if br_i > best_score:
+                best_score = br_i
+                best_url = u
+        return best_url
+
+    def _invidious_pick_audio_url(self, vid: str) -> str:
+        api = f"https://yewtu.be/api/v1/videos/{vid}"
+        r = requests.get(api, timeout=15, headers={"User-Agent": USER_AGENT})
+        r.raise_for_status()
+        data = r.json()
+        fmts = data.get("adaptiveFormats") or data.get("formatStreams") or []
+        best_url = ""
+        best_score = -1
+        for f in fmts:
+            if not isinstance(f, dict):
+                continue
+            u = (f.get("url") or "").strip()
+            mime = (f.get("type") or f.get("mimeType") or "").lower()
+            if not u:
+                continue
+            if "audio" not in mime:
+                continue
+            br = f.get("bitrate") or 0
+            try:
+                br_i = int(br)
+            except Exception:
+                br_i = 0
+            if br_i > best_score:
+                best_score = br_i
+                best_url = u
+        return best_url
+
     def _ytdlp_list_playlist(self, url: str) -> Tuple[str, List[str]]:
         """
-        Returns (playlist_title, entry_urls)
+        Fixes:
+          - Duplicate playlist folder names (title repetition): read a single JSON, not printed lines.
+          - Generic playlist folder name: prefer playlist title, else fallback.
         """
-        # playlist title (best-effort)
-        title = ""
         try:
             out, _ = run_cmd(
                 [
                     str(YTDLP_PATH),
-                    "--skip-download",
-                    "--print",
-                    "%(playlist_title)s",
+                    "-J",
+                    "--flat-playlist",
                     "--no-warnings",
                     url,
                 ],
                 cwd=self.run_root,
-                timeout=60,
+                timeout=180,
             )
-            title = (out or "").strip()
-        except Exception:
+            data = json.loads(out or "{}")
+        except Exception as e:
+            raise AppError(f"Failed to read playlist metadata.\n\n{e}") from e
+
+        title = (data.get("title") or data.get("playlist_title") or data.get("playlist") or "").strip()
+        if not title:
             title = "Playlist"
 
-        # entries
-        # Use --flat-playlist for speed, print original_url for each entry
-        try:
-            out, _ = run_cmd(
-                [
-                    str(YTDLP_PATH),
-                    "--flat-playlist",
-                    "--print",
-                    "%(original_url)s",
-                    "--no-warnings",
-                    url,
-                ],
-                cwd=self.run_root,
-                timeout=120,
-            )
-        except AppError as e:
-            raise AppError(f"Failed to read playlist.\n\n{e}") from e
-
-        lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
-        # Filter obviously non-urls
-        urls = [ln for ln in lines if ln.startswith("http")]
-        if not urls:
-            # fallback: try video ids
-            urls = []
-            for ln in lines:
-                if re.fullmatch(r"[\w-]{6,}", ln):
-                    urls.append(f"https://www.youtube.com/watch?v={ln}")
+        entries = data.get("entries") or []
+        urls: List[str] = []
+        for ent in entries:
+            if isinstance(ent, dict):
+                u = (ent.get("url") or ent.get("webpage_url") or ent.get("original_url") or "").strip()
+                if u and u.startswith("http"):
+                    urls.append(u)
+                    continue
+                vid = (ent.get("id") or "").strip()
+                if vid:
+                    urls.append(f"https://www.youtube.com/watch?v={vid}")
+            elif isinstance(ent, str) and ent.strip():
+                s = ent.strip()
+                if s.startswith("http"):
+                    urls.append(s)
+                elif re.fullmatch(r"[\w-]{6,}", s):
+                    urls.append(f"https://www.youtube.com/watch?v={s}")
 
         if not urls:
             raise AppError("Playlist detected, but no entries could be extracted.")
 
-        return title or "Playlist", urls
+        return title, urls
+
+
+# -------- Metadata Review Dialog --------
+class ReviewDialog(QtWidgets.QDialog):
+    def __init__(self, parent: QtWidgets.QWidget, payload: dict):
+        super().__init__(parent)
+        self.setWindowTitle(f"{APP_NAME} — Review Metadata")
+        self.setModal(True)
+
+        self._request_id = payload.get("request_id", "")
+        self._candidates = payload.get("candidates", []) or []
+        yt_raw = payload.get("yt_raw", "")
+        yt_parsed = payload.get("yt_parsed", "")
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(10)
+
+        lbl = QtWidgets.QLabel("Metadata mismatch detected. Please confirm the correct track:")
+        lbl.setWordWrap(True)
+
+        yt1 = QtWidgets.QLabel(f"<b>Original YouTube title:</b><br>{html.escape(yt_raw)}")
+        yt1.setWordWrap(True)
+        yt2 = QtWidgets.QLabel(f"<b>Parsed title:</b><br>{html.escape(yt_parsed)}")
+        yt2.setWordWrap(True)
+
+        self.combo = QtWidgets.QComboBox()
+        for i, line in enumerate(self._candidates):
+            self.combo.addItem(line, userData=str(i))
+
+        btns = QtWidgets.QHBoxLayout()
+        btns.addStretch(1)
+        ok = QtWidgets.QPushButton("Use Selection")
+        cancel = QtWidgets.QPushButton("Cancel (keep current)")
+        btns.addWidget(cancel)
+        btns.addWidget(ok)
+
+        ok.clicked.connect(self.accept)
+        cancel.clicked.connect(self._cancel_keep_current)
+
+        root.addWidget(lbl)
+        root.addWidget(yt1)
+        root.addWidget(yt2)
+        root.addWidget(QtWidgets.QLabel("<b>Choose match:</b>"))
+        root.addWidget(self.combo)
+        root.addLayout(btns)
+
+        if self.combo.count() > 0:
+            self.combo.setCurrentIndex(0)
+
+        self._chosen_key = "0"
+
+    def _cancel_keep_current(self):
+        self._chosen_key = "0"
+        self.reject()
+
+    def accept(self):
+        data = self.combo.currentData()
+        self._chosen_key = str(data) if data is not None else "0"
+        super().accept()
+
+    @property
+    def request_id(self) -> str:
+        return self._request_id
+
+    @property
+    def chosen_key(self) -> str:
+        return self._chosen_key
 
 
 # UI: compact single-screen widget
 class MainWidget(QtWidgets.QWidget):
+    review_result = QtCore.Signal(str, str, object)  # request_id, chosen_key, unused (keeps signature stable)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_NAME)
         self.setAcceptDrops(True)
-        
-        # Force only: minimize + close (no maximize)
+
         flags = (
             QtCore.Qt.Window
             | QtCore.Qt.CustomizeWindowHint
@@ -1696,8 +2260,7 @@ class MainWidget(QtWidgets.QWidget):
             | QtCore.Qt.WindowCloseButtonHint
         )
         self.setWindowFlags(flags)
-        
-        # UI
+
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(14, 14, 14, 14)
         root.setSpacing(10)
@@ -1739,76 +2302,55 @@ class MainWidget(QtWidgets.QWidget):
 
         root.addWidget(card)
 
-        # threading
         self._thread: Optional[QtCore.QThread] = None
         self._worker: Optional[PipelineWorker] = None
         self._running = False
 
-        # debounce auto-start
         self._debounce = QtCore.QTimer(self)
         self._debounce.setSingleShot(True)
         self._debounce.timeout.connect(self._maybe_start_from_text)
 
         self.edit.textChanged.connect(self._on_text_changed)
 
-        # fixed size: compact but safe (no clipping) — computed after fonts/style are applied
         self._size_locked = False
-
         self._set_running(False)
         self.status.setText("")
 
     def showEvent(self, event: QtGui.QShowEvent):
-        # Lock the size once, after Qt has polished the widget with the final font/style/DPI.
         if not self._size_locked:
             self._lock_size()
             self._size_locked = True
         super().showEvent(event)
 
     def _lock_size(self):
-        """
-        Explicitly fixed, compact window size with a guarantee that all widgets fit:
-        - Picks the smallest width in a safe range that yields the smallest overall sizeHint()
-          (after word-wrapped labels settle), then fixes the window to that exact size.
-        - Avoids clipping/overflow across common DPI settings because this is based on Qt's own layout metrics.
-        """
-        # Force layout to exist and be up-to-date
         lay = self.layout()
         if lay:
             lay.activate()
 
-        # Range chosen to stay "small/compact" while still preventing pathological wraps.
-        # (Qt uses device-independent pixels; this remains stable across DPI scaling.)
         min_w = 380
-        max_w = 520
+        max_w = 560
         step = 10
 
         best_w = max_w
         best_h = 99999
         best_area = 10**18
 
-        # Temporarily allow resizing during measurement
         self.setMinimumSize(0, 0)
         self.setMaximumSize(16777215, 16777215)
 
         for w in range(min_w, max_w + 1, step):
-            # Fix width, let layout compute height
             self.resize(w, 10)
             self.setFixedWidth(w)
             if lay:
                 lay.activate()
             hint = self.sizeHint()
-
-            # Add a tiny safety pad to absorb fractional rounding at some DPIs/styles.
             h = int(hint.height() + 2)
             area = int(w * h)
-
-            # Prefer smallest area; tie-breaker: smaller width
             if area < best_area or (area == best_area and w < best_w):
                 best_area = area
                 best_w = w
                 best_h = h
 
-        # Apply final fixed size
         self.setFixedSize(int(best_w), int(best_h))
 
     def _valid_url(self, text: str) -> bool:
@@ -1822,7 +2364,6 @@ class MainWidget(QtWidgets.QWidget):
     def _on_text_changed(self, _text: str):
         if self._running:
             return
-        # debounce so pasting large URL doesn't trigger twice
         self._debounce.start(250)
 
     def _maybe_start_from_text(self):
@@ -1834,7 +2375,6 @@ class MainWidget(QtWidgets.QWidget):
             self.progress.setValue(0)
             return
 
-        # playlist prompt logic
         intent = classify_youtube_url(url)
         playlist_mode = "single"
         final_url = url
@@ -1847,7 +2387,6 @@ class MainWidget(QtWidgets.QWidget):
                 return
             if choice == "single":
                 playlist_mode = "single"
-                # if it's a watch URL with list=..., strip playlist params
                 final_url = strip_playlist_from_watch_url(url)
             elif choice == "playlist":
                 playlist_mode = "playlist"
@@ -1856,9 +2395,6 @@ class MainWidget(QtWidgets.QWidget):
         self._start(final_url, playlist_mode)
 
     def _playlist_prompt(self, url: str) -> str:
-        """
-        Returns: "playlist" | "single" | "cancel"
-        """
         box = QtWidgets.QMessageBox(self)
         box.setWindowTitle(APP_NAME)
         box.setIcon(QtWidgets.QMessageBox.Question)
@@ -1906,7 +2442,15 @@ class MainWidget(QtWidgets.QWidget):
         self._worker.error.connect(self._on_error)
         self._worker.finished.connect(self._on_finished)
 
+        self._worker.review_needed.connect(self._on_review_needed)
+        self.review_result.connect(self._worker.receive_review_result, QtCore.Qt.QueuedConnection)
+
         self._thread.start()
+
+    def _on_review_needed(self, payload: dict):
+        dlg = ReviewDialog(self, payload)
+        dlg.exec()
+        self.review_result.emit(dlg.request_id, dlg.chosen_key, None)
 
     def _cleanup_thread(self):
         if self._thread:
@@ -1935,7 +2479,6 @@ class MainWidget(QtWidgets.QWidget):
         elif len(paths) == 1:
             QtWidgets.QMessageBox.information(self, APP_NAME, f"Saved:\n{paths[0]}")
         else:
-            # Playlist: keep it concise
             folder = str(Path(paths[0]).parent)
             QtWidgets.QMessageBox.information(self, APP_NAME, f"Saved {len(paths)} files to:\n{folder}")
 
@@ -1963,7 +2506,7 @@ def set_app_icon(app: QtWidgets.QApplication):
 
 # Main
 def main():
-    mutex = SingleInstance(r"Global\YTDL_SINGLE_INSTANCE_MUTEX_v2")
+    mutex = SingleInstance(r"Global\YTDL_SINGLE_INSTANCE_MUTEX_v4")
     if not mutex.acquire():
         app = QtWidgets.QApplication(sys.argv)
         app.setStyleSheet(QSS)
@@ -1986,4 +2529,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
